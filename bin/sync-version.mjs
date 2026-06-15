@@ -4,9 +4,10 @@
 // node bin/sync-version.mjs --check 0.1.1
 // node bin/sync-version.mjs --help
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
@@ -22,6 +23,7 @@ const jsonTargets = [
   },
   {
     file: "sdk/package-lock.json",
+    optional: true,
     getVersions: (data) => [
       getJsonVersionEntry(data, "version"),
       getPackageLockRootVersionEntry(data),
@@ -38,6 +40,7 @@ const jsonTargets = [
   },
   {
     file: "desktop/package-lock.json",
+    optional: true,
     getVersions: (data) => [
       getJsonVersionEntry(data, "version"),
       getPackageLockRootVersionEntry(data),
@@ -66,6 +69,8 @@ const targets = [
     type: "toml",
   },
 ];
+
+const npmInstallTargets = ["desktop", "sdk"];
 
 main().catch((error) => {
   console.error(`Error: ${error.message}`);
@@ -104,6 +109,8 @@ async function main() {
     console.log(`${update.changed ? "updated" : "unchanged"} ${update.file}`);
   }
 
+  console.log("");
+  await reinstallNpmDependencies();
   console.log("");
   console.log("Done.");
 }
@@ -149,6 +156,10 @@ async function readVersionFiles() {
     try {
       content = await readFile(absolutePath, "utf8");
     } catch (error) {
+      if (target.optional && error.code === "ENOENT") {
+        continue;
+      }
+
       throw new Error(`Failed to read ${target.file}: ${error.message}`);
     }
 
@@ -323,4 +334,38 @@ function prepareUpdates(files, version) {
 function updateJsonContent(file, version) {
   file.update(file.data, version);
   return `${JSON.stringify(file.data, null, 2)}\n`;
+}
+
+async function reinstallNpmDependencies() {
+  for (const target of npmInstallTargets) {
+    const absolutePath = path.join(repoRoot, target);
+
+    console.log(`Reinstalling npm dependencies in ${target}...`);
+    await removeIfExists(path.join(absolutePath, "node_modules"));
+    await removeIfExists(path.join(absolutePath, "package-lock.json"));
+    await runNpmInstall(absolutePath);
+  }
+}
+
+async function removeIfExists(absolutePath) {
+  await rm(absolutePath, { force: true, recursive: true });
+}
+
+async function runNpmInstall(cwd) {
+  const child =
+    process.platform === "win32"
+      ? spawn("npm install", { cwd, shell: true, stdio: "inherit" })
+      : spawn("npm", ["install"], { cwd, stdio: "inherit" });
+
+  await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(`npm install failed in ${path.relative(repoRoot, cwd)}.`));
+    });
+  });
 }
