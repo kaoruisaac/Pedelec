@@ -1,10 +1,10 @@
 # Pedelec
 
-Pedelec 是一套讓網頁前端可以呼叫本機 AI coding agent 的橋接架構。
+Pedelec is a bridge architecture that lets web frontends call local AI coding agents.
 
-它的核心目標是：**讓 Web App 透過 SDK 建立 agent session、傳送使用者訊息、接收 agent 串流回應，並在 agent 需要操作前端狀態時，把 tool call 安全地交回 Web App 處理。**
+Its core goal is: **to let a Web App create agent sessions through the SDK, send user messages, receive streamed agent responses, and safely hand tool calls back to the Web App whenever the agent needs to operate on frontend state.**
 
-整體資料流可以想成：
+The overall data flow can be understood as:
 
 ```txt
 Web App / SDK
@@ -19,36 +19,36 @@ pedelec-app Desktop Runtime
 Codex / Gemini / OpenCode / Cursor / Claude Code agent
 ```
 
-Web App 不直接碰本機 process，也不需要自己開 localhost server。SDK 只負責和 extension 溝通；extension 負責把請求送到 native host；desktop app 是唯一的 CoreRuntime owner，真正負責建立 session、管理 provider process、轉發事件與處理 tool result。
+The Web App does not directly touch local processes and does not need to start its own localhost server. The SDK only communicates with the extension; the extension forwards requests to the native host; the desktop app is the only CoreRuntime owner and is responsible for creating sessions, managing provider processes, forwarding events, and handling tool results.
 
 ---
 
-## Repo 結構
+## Repo Structure
 
 ```txt
-sdk/        Web App 端使用的 TypeScript SDK
-extension/  Chrome extension，負責 external SDK connection、origin approval 與 native messaging bridge
-desktop/    Tauri desktop app、CoreRuntime、native host、pedelec-cli
+sdk/        TypeScript SDK used by Web Apps
+extension/  Chrome extension responsible for external SDK connections, origin approval, and the native messaging bridge
+desktop/    Tauri desktop app, CoreRuntime, native host, and pedelec-cli
 ```
 
 ---
 
-## SDK 使用前提
+## SDK Prerequisites
 
-Pedelec SDK 必須在瀏覽器頁面環境中執行，並且需要：
+The Pedelec SDK must run in a browser page environment and requires:
 
-1. 使用者已安裝 Pedelec Chrome Extension。
-2. 使用者已啟動 Pedelec Desktop App。
-3. Desktop App 已註冊 Chrome Native Messaging host。
-4. 目標 provider CLI 已安裝在使用者本機，例如 `codex`、`gemini`、`opencode`、`cursor` 或 `claude`。
+1. The user has installed the Pedelec Chrome Extension.
+2. The user has started the Pedelec Desktop App.
+3. The Desktop App has registered the Chrome Native Messaging host.
+4. The target provider CLI has been installed on the user's machine, such as `codex`, `gemini`, `opencode`, `cursor`, or `claude`.
 
-SDK 不適合直接在 Node.js、SSR server 或 background worker 裡使用；它需要 Chrome 頁面環境中的 extension runtime messaging。
+The SDK is not suitable for direct use in Node.js, an SSR server, or a background worker; it needs extension runtime messaging from a Chrome page environment.
 
 ---
 
-## 安裝與引用 SDK
+## Installing and Importing the SDK
 
-SDK 套件位於 `sdk/`：
+The SDK package is located in `sdk/`:
 
 ```bash
 cd sdk
@@ -56,13 +56,13 @@ npm install
 npm run build
 ```
 
-在 Web App 端引用：
+Import it from the Web App:
 
 ```ts
 import { Pedelec } from "@kaoruisaac/pedelec";
 ```
 
-如果尚未發布到 npm，可以先用本地 path 安裝：
+If it has not been published to npm yet, install it from a local path first:
 
 ```bash
 npm install ../path/to/pedelec/sdk
@@ -70,7 +70,7 @@ npm install ../path/to/pedelec/sdk
 
 ---
 
-## 最小使用範例
+## Minimal Example
 
 ```ts
 import { Pedelec } from "@kaoruisaac/pedelec";
@@ -87,7 +87,7 @@ const session = await pedelec.createSession({
 });
 
 session.onChat((text) => {
-  // agent 的文字串流增量
+  // Incremental text stream from the agent.
   console.log(text);
 });
 
@@ -100,18 +100,18 @@ session.onError((error) => {
   console.error(error.code, error.message, error.details);
 });
 
-await session.sendText("請幫我分析目前頁面的狀態");
+await session.sendText("Please help me analyze the current page state");
 ```
 
-`sendText()` 會在本輪 agent 回應完成後 resolve；如果 session 已經在處理上一個 prompt，新的 `sendText()` 會被拒絕，避免同一個 session 同時跑多個請求。
+`sendText()` resolves after the current agent response completes. If the session is already handling a previous prompt, the new `sendText()` call is rejected to prevent multiple concurrent requests from running in the same session.
 
 ---
 
-## 建立 Session
+## Creating a Session
 
-首次在某個 origin 呼叫 `createSession()` 或 `resumeSession()` 時，extension 會要求使用者在 popup 中核准該 origin。核准後同一個 origin 之後可直接建立 session。
+The first time an origin calls `createSession()` or `resumeSession()`, the extension asks the user to approve that origin in the popup. After approval, the same origin can create sessions directly.
 
-可以先查詢目前 origin 的 approval 狀態，用來決定是否顯示「Connect Pedelec」類 UI：
+You can query the current origin's approval status first to decide whether to show UI such as "Connect Pedelec":
 
 ```ts
 const status = await pedelec.getApprovalStatus();
@@ -119,7 +119,7 @@ const status = await pedelec.getApprovalStatus();
 console.log(status.installed, status.approved, status.origin);
 ```
 
-### 指定 provider 與 model
+### Specifying Provider and Model
 
 ```ts
 const session = await pedelec.createSession({
@@ -128,19 +128,19 @@ const session = await pedelec.createSession({
 });
 ```
 
-目前 SDK 支援的 provider code：
+Currently supported provider codes in the SDK:
 
-| Provider | Code | model 範例 |
+| Provider | Code | Example model |
 | --- | --- | --- |
 | Codex | `codex` | `gpt-5` |
-| Gemini | `gemini` | provider 自己支援的 model id |
+| Gemini | `gemini` | Any model ID supported by the provider |
 | OpenCode | `opencode` | `ollama/qwen2.5-coder:14b` |
 | Cursor | `cursor` | `gpt-5` |
 | Claude Code | `claude` | `sonnet` |
 
-### 使用 Desktop App 預設 provider
+### Using the Desktop App's Default Provider
 
-如果 Desktop App 已設定 default provider，可以不傳 `provider`：
+If the Desktop App has a default provider configured, you can omit `provider`:
 
 ```ts
 const session = await pedelec.createSession({
@@ -148,9 +148,9 @@ const session = await pedelec.createSession({
 });
 ```
 
-這會先讀取 Desktop App 的 `defaultProvider` 與 `defaultModel`。如果沒有設定 default provider，SDK 會拋出 `DEFAULT_PROVIDER_NOT_SET`。
+This first reads `defaultProvider` and `defaultModel` from the Desktop App. If no default provider is configured, the SDK throws `DEFAULT_PROVIDER_NOT_SET`.
 
-### 只指定 provider
+### Specifying Only the Provider
 
 ```ts
 const session = await pedelec.createSession({
@@ -158,11 +158,11 @@ const session = await pedelec.createSession({
 });
 ```
 
-如果 Desktop App 的 default provider 也是 `codex`，SDK 會沿用 default model；如果不是，則只傳 provider，不強制帶 model。
+If the Desktop App's default provider is also `codex`, the SDK reuses the default model. Otherwise, it only sends the provider and does not force a model.
 
 ---
 
-## 查詢 Providers
+## Listing Providers
 
 ```ts
 const providers = await pedelec.listProviders();
@@ -172,7 +172,7 @@ for (const provider of providers) {
 }
 ```
 
-回傳格式：
+Return format:
 
 ```ts
 type ProviderInfo = {
@@ -184,11 +184,11 @@ type ProviderInfo = {
 };
 ```
 
-`available: false` 通常代表該 provider CLI 沒有安裝，或不在 PATH 裡。
+`available: false` usually means that the provider CLI is not installed or is not in `PATH`.
 
 ---
 
-## 讀取 Desktop App 設定
+## Reading Desktop App Settings
 
 ```ts
 const settings = await pedelec.getSettings();
@@ -197,7 +197,7 @@ console.log(settings.defaultProvider);
 console.log(settings.defaultModel);
 ```
 
-回傳格式：
+Return format:
 
 ```ts
 type PedelecSettings = {
@@ -208,7 +208,7 @@ type PedelecSettings = {
 
 ---
 
-## 接收 Agent 回應
+## Receiving Agent Responses
 
 ```ts
 const chunks: string[] = [];
@@ -219,11 +219,11 @@ session.onChat((text) => {
 });
 ```
 
-`onChat()` 收到的是文字增量，不一定是一整句，也不一定是一整段。UI 通常需要自己累積成完整訊息。
+`onChat()` receives incremental text. It may not be a complete sentence or a complete paragraph. The UI usually needs to accumulate chunks into a complete message.
 
 ---
 
-## 監聽 Session 狀態
+## Listening to Session Status
 
 ```ts
 session.onStatus((status) => {
@@ -242,31 +242,31 @@ session.onStatus((status) => {
 });
 ```
 
-常見狀態：
+Common statuses:
 
-| 狀態 | 意義 |
+| Status | Meaning |
 | --- | --- |
-| `idle` | session 可接收下一個 prompt |
-| `running` | agent 正在處理使用者輸入 |
-| `waiting_tool_result` | agent 發出 tool call，正在等待前端回傳結果 |
-| `ended` | session 已結束 |
-| `error` | session 發生錯誤 |
+| `idle` | The session can receive the next prompt |
+| `running` | The agent is processing user input |
+| `waiting_tool_result` | The agent has issued a tool call and is waiting for the frontend to return a result |
+| `ended` | The session has ended |
+| `error` | The session encountered an error |
 
 ---
 
-## Tool Calling：讓 Agent 操作 Web App
+## Tool Calling: Letting the Agent Operate on the Web App
 
-Pedelec 的 tool calling 流程是：
+Pedelec's tool calling flow is:
 
-1. Web App 在 `skillsUrls` 提供 tool 說明，例如 `tools.md` 與 `tools.json`。
-2. Desktop Runtime 把 skills 放進 agent sandbox。
-3. Agent 需要前端資料或操作時，在本機執行 `pedelec-cli tool-call ...`。
-4. Desktop Runtime 收到 tool call 後，透過 native host 與 extension 送回 SDK。
-5. SDK 觸發 `session.onTool()`。
-6. Web App 執行對應工具並 return result。
-7. SDK 自動把 result submit 回 Desktop Runtime，再交給 agent 繼續推理。
+1. The Web App provides tool instructions in `skillsUrls`, such as `tools.md` and `tools.json`.
+2. The Desktop Runtime places the skills into the agent sandbox.
+3. When the agent needs frontend data or an action, it executes `pedelec-cli tool-call ...` locally.
+4. After the Desktop Runtime receives the tool call, it sends it back to the SDK through the native host and extension.
+5. The SDK triggers `session.onTool()`.
+6. The Web App executes the corresponding tool and returns the result.
+7. The SDK automatically submits the result back to the Desktop Runtime, then hands it to the agent so reasoning can continue.
 
-範例：
+Example:
 
 ```ts
 session.onTool(async (tool, args) => {
@@ -296,13 +296,13 @@ session.onTool(async (tool, args) => {
 });
 ```
 
-`onTool()` 的回傳值必須可以 JSON serialize。SDK 會自動把回傳值送回 runtime，不需要手動呼叫 `submit_tool_result`。
+The return value from `onTool()` must be JSON serializable. The SDK automatically sends the return value back to the runtime; you do not need to manually call `submit_tool_result`.
 
 ---
 
-## Resume 既有 Session
+## Resuming an Existing Session
 
-如果你有保存 `sessionId`，可以重新接回既有 session：
+If you have saved a `sessionId`, you can reconnect to an existing session:
 
 ```ts
 const session = await pedelec.resumeSession("thread_abc123");
@@ -311,24 +311,24 @@ session.onChat((text) => {
   console.log(text);
 });
 
-await session.sendText("繼續剛剛的工作");
+await session.sendText("Continue the previous work");
 ```
 
 ---
 
-## 結束 Session
+## Ending a Session
 
 ```ts
 await session.end();
 ```
 
-結束後，該 session 不能再呼叫 `sendText()`。如果需要新的對話，請重新 `createSession()`。
+After a session ends, `sendText()` can no longer be called on it. Create a new session with `createSession()` if you need a new conversation.
 
 ---
 
-## 錯誤處理
+## Error Handling
 
-建議所有 SDK 操作都包在 `try/catch`，並同時註冊 `onError()`：
+It is recommended to wrap all SDK operations in `try/catch` and also register `onError()`:
 
 ```ts
 session.onError((error) => {
@@ -336,32 +336,32 @@ session.onError((error) => {
 });
 
 try {
-  await session.sendText("請幫我修改這段內容");
+  await session.sendText("Please help me edit this content");
 } catch (error) {
   console.error("send failed", error);
 }
 ```
 
-常見錯誤：
+Common errors:
 
-| code | 可能原因 |
+| code | Possible cause |
 | --- | --- |
-| `EXTENSION_UNAVAILABLE` | SDK 不在瀏覽器頁面中執行，或 extension 無法連線 |
-| `EXTENSION_DISCONNECTED` | extension 連線中斷 |
-| `SDK_BRIDGE_TIMEOUT` | extension 沒有在 timeout 內回應 |
-| `APPROVAL_REJECTED` | 使用者拒絕目前 origin 使用 Pedelec |
-| `APPROVAL_TIMEOUT` | 使用者未在期限內完成 origin approval |
-| `OPEN_POPUP_FAILED` | extension 無法自動開啟 approval popup |
-| `NATIVE_HOST_UNAVAILABLE` | Chrome Native Messaging host 無法連線 |
-| `DEFAULT_PROVIDER_NOT_SET` | Desktop App 尚未設定 default provider |
-| `DEFAULT_PROVIDER_UNAVAILABLE` | default provider CLI 不可用 |
-| `SESSION_BUSY` | 同一個 session 已有 prompt 正在執行 |
-| `SESSION_ENDED` | session 已結束 |
-| `TOOL_HANDLER_NOT_FOUND` | agent 呼叫 tool，但 Web App 沒有註冊 handler |
+| `EXTENSION_UNAVAILABLE` | The SDK is not running in a browser page, or the extension cannot connect |
+| `EXTENSION_DISCONNECTED` | The extension connection was interrupted |
+| `SDK_BRIDGE_TIMEOUT` | The extension did not respond before the timeout |
+| `APPROVAL_REJECTED` | The user rejected Pedelec access for the current origin |
+| `APPROVAL_TIMEOUT` | The user did not complete origin approval in time |
+| `OPEN_POPUP_FAILED` | The extension could not automatically open the approval popup |
+| `NATIVE_HOST_UNAVAILABLE` | The Chrome Native Messaging host could not connect |
+| `DEFAULT_PROVIDER_NOT_SET` | The Desktop App has not configured a default provider |
+| `DEFAULT_PROVIDER_UNAVAILABLE` | The default provider CLI is unavailable |
+| `SESSION_BUSY` | The same session already has a prompt running |
+| `SESSION_ENDED` | The session has ended |
+| `TOOL_HANDLER_NOT_FOUND` | The agent called a tool, but the Web App did not register a handler |
 
 ---
 
-## 頂層架構
+## Top-Level Architecture
 
 ```mermaid
 sequenceDiagram
@@ -394,31 +394,31 @@ sequenceDiagram
   SDK-->>App: onChat / onStatus / onTool
 ```
 
-### 每一層的責任
+### Responsibilities of Each Layer
 
-| 層級 | 責任 |
+| Layer | Responsibility |
 | --- | --- |
-| SDK | 提供 Web App API、維護 session callback、處理 request timeout 與事件去重 |
-| Background | 管理 SDK external channel、origin approval、連線 native host、把 core event 轉成 SDK event |
-| Native Host | Chrome Native Messaging 入口，轉送 request/event 到 Core IPC |
-| Desktop Runtime | 唯一的 session/runtime owner，管理 thread、skills、provider process 與 tool request |
-| Agent CLI | 實際執行 Codex/Gemini/OpenCode/Cursor/Claude Code，並透過 `pedelec-cli` 呼叫前端工具 |
+| SDK | Provides the Web App API, maintains session callbacks, handles request timeouts and event deduplication |
+| Background | Manages SDK external channels, origin approval, native host connections, and converts core events into SDK events |
+| Native Host | Chrome Native Messaging entry point that forwards requests/events to Core IPC |
+| Desktop Runtime | The only session/runtime owner, managing threads, skills, provider processes, and tool requests |
+| Agent CLI | Actually runs Codex/Gemini/OpenCode/Cursor/Claude Code and calls frontend tools through `pedelec-cli` |
 
 ---
 
-## 開發流程
+## Development Workflow
 
-### 開發用 Extension ID
+### Development Extension ID
 
-如果使用 unpacked extension，先在 repo 根目錄建立 `.env.local`：
+When using the unpacked extension, first create `.env.local` in the repo root:
 
 ```txt
 PEDELEC_DEV_CHROME_EXTENSION_ID=mifjcaefhmigmhmejhficbnhgnecfibk
 ```
 
-Desktop debug build 與 demo dev server 會讀取這個值；讀不到或格式不正確時會使用正式 extension ID。
+Desktop debug builds and the demo dev server read this value. If it cannot be read or the format is invalid, the production extension ID is used.
 
-### 啟動 Desktop App
+### Starting the Desktop App
 
 ```bash
 cd desktop
@@ -426,15 +426,15 @@ npm install
 npm run tauri dev
 ```
 
-### 載入 Chrome Extension
+### Loading the Chrome Extension
 
-1. 開啟 `chrome://extensions`。
-2. 開啟 Developer mode。
-3. 點選 **Load unpacked**。
-4. 選擇 `extension/` 資料夾。
-5. 啟動或重啟 Desktop App，讓它註冊 native messaging host。
+1. Open `chrome://extensions`.
+2. Enable Developer mode.
+3. Click **Load unpacked**.
+4. Select the `extension/` folder.
+5. Start or restart the Desktop App so it registers the native messaging host.
 
-### 建置 SDK
+### Building the SDK
 
 ```bash
 cd sdk
@@ -444,10 +444,10 @@ npm run build
 
 ---
 
-## 設計重點
+## Design Highlights
 
-- Web App 只依賴 SDK，不直接知道 native host 或 Core IPC 細節。
-- Extension 是 Web App 與本機 runtime 的唯一瀏覽器橋接層。
-- Desktop App 是唯一 CoreRuntime owner，避免 extension、native host、desktop 同時建立各自的 session state。
-- Agent 不直接操作 Web App；它只能透過 `pedelec-cli` 發出 tool call，再由 SDK 交給 Web App 決定是否執行。
-- Tool result 由 Web App 回傳，runtime 再交給 agent，讓前端狀態與本機 agent 能保持同步。
+- The Web App only depends on the SDK and does not directly know about the native host or Core IPC details.
+- The extension is the only browser bridge between the Web App and the local runtime.
+- The Desktop App is the only CoreRuntime owner, preventing the extension, native host, and desktop app from each creating their own session state.
+- The agent does not directly operate on the Web App; it can only issue tool calls through `pedelec-cli`, then the SDK lets the Web App decide whether to execute them.
+- Tool results are returned by the Web App and then passed from the runtime to the agent, keeping frontend state and the local agent in sync.
