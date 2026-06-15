@@ -1,0 +1,6073 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, ExitStatus};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use url::Url;
+
+const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_MAX_SKILL_SIZE_BYTES: u64 = 1024 * 1024;
+const SANDBOX_SUBDIRS: [&str; 5] = ["skills", "input", "output", "logs", "tmp"];
+const TOOL_TIMEOUT_OVERRIDE_FIELD: &str = "timeoutMs";
+const THREAD_ID_BASE36_MIN_WIDTH: usize = 6;
+const THREAD_ID_BASE36_MAX_WIDTH: usize = 7;
+const THREAD_ID_MAX_COUNTER: u64 = 78_364_164_095;
+const BUILTIN_PEDELEC_TOOL_FILENAME: &str = "pedelec-cli.md";
+const BUILTIN_PEDELEC_TOOL_ORIGINAL_URL: &str = "builtin:pedelec-cli.md";
+const BUILTIN_PEDELEC_TOOL_TEMPLATE: &str = r##"# Pedelec Tool Calling
+
+Use `pedelec-cli` to call a host-app tool from inside a Pedelec provider session.
+
+This file only explains how to call tools. Available tools and their arguments are documented in `skills/tools.md`.
+
+## When to call a tool
+
+Call `pedelec-cli` only when all conditions are true:
+
+- The user request needs information or an action from the host app.
+- The tool exists in `skills/tools.md`.
+- You can provide valid JSON object arguments for that tool.
+
+Do not invent tool names or call tools that are not listed in `skills/tools.md`.
+
+## Command format
+
+```bash
+pedelec-cli tool-call <thread_id> <tool_name> '<json_args>'
+```
+
+- `<thread_id>`: The constant id to be included.
+- `<tool_name>`: exact tool name from `skills/tools.md`.
+- `<json_args>`: valid JSON object. Use `{}` when the tool has no arguments.
+
+Examples:
+
+```bash
+pedelec-cli tool-call <thread_id> get_current_page '{}'
+pedelec-cli tool-call <thread_id> ask_user '{"question":"Which option do you prefer?"}'
+```
+
+## JSON arguments
+
+Arguments must always be a JSON object.
+
+Valid:
+
+```json
+{}
+```
+
+```json
+{"question":"Which option do you prefer?"}
+```
+
+Invalid:
+
+```json
+null
+```
+
+```json
+"hello"
+```
+
+```json
+["item"]
+```
+
+Prefer single quotes around the JSON in shell commands so inner double quotes do not need escaping.
+
+## Result handling
+
+`pedelec-cli` prints exactly one JSON object to stdout.
+
+Success:
+
+```json
+{"ok":true,"result":{}}
+```
+
+Failure:
+
+```json
+{"ok":false,"error":{"code":"TOOL_ARGS_INVALID","message":"tool args must be valid JSON","details":{}}}
+```
+
+Always inspect `ok`.
+
+- If `ok` is `true`, use `result`.
+- If `ok` is `false`, treat the call as failed.
+- If the failure is caused by invalid arguments, retry only after correcting the arguments.
+- Do not repeat the same failing call without changing anything.
+
+## Timeout
+
+Each tool has a default timeout defined by the app.
+
+Some tools may allow `timeoutMs` in the JSON arguments:
+
+```bash
+pedelec-cli tool-call <thread_id> long_running_tool '{"timeoutMs":120000}'
+```
+
+Use `timeoutMs` only when the tool documentation allows it or the task clearly needs more time.
+
+## Workflow
+
+1. Read `skills/tools.md`.
+2. Pick the exact tool name.
+3. Build a valid JSON object for arguments.
+4. Run `pedelec-cli tool-call`.
+5. Parse stdout as JSON.
+6. Continue based on `ok`, `result`, or `error`.
+
+## Notes
+
+- `skills/tools.md` is for the agent to understand available tools.
+- `skills/tools.json` is for runtime validation and normally does not need to be read or edited.
+"##;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PedelecError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+impl PedelecError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn with_details(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: Some(details),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadState {
+    pub thread_id: String,
+    pub provider: ProviderCode,
+    pub model: Option<String>,
+    pub sandbox_path: PathBuf,
+    pub skills: Vec<SkillFile>,
+    pub status: ThreadStatus,
+    pub process_id: Option<u32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAdapterState {
+    pub provider_session_id: Option<String>,
+    pub last_process_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadStatus {
+    Idle,
+    Starting,
+    Running,
+    WaitingToolResult,
+    Stopping,
+    Ended,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderCode {
+    Codex,
+    Gemini,
+    OpenCode,
+    Cursor,
+    Claude,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInfo {
+    pub name: String,
+    pub code: ProviderCode,
+    pub path: Option<String>,
+    pub available: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PedelecSettings {
+    pub default_provider: Option<ProviderCode>,
+    pub default_model: Option<String>,
+}
+
+impl Default for PedelecSettings {
+    fn default() -> Self {
+        Self {
+            default_provider: None,
+            default_model: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSettingsInput {
+    pub default_provider: ProviderCode,
+    pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFile {
+    pub original_url: String,
+    pub original_filename: String,
+    pub local_path: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ThreadEvent {
+    Created {
+        seq: u64,
+        thread_id: String,
+    },
+    StatusChanged {
+        seq: u64,
+        thread_id: String,
+        status: ThreadStatus,
+    },
+    RawStdout {
+        seq: u64,
+        thread_id: String,
+        text: String,
+    },
+    RawStderr {
+        seq: u64,
+        thread_id: String,
+        text: String,
+    },
+    AssistantMessage {
+        seq: u64,
+        thread_id: String,
+        text: String,
+    },
+    ToolCall {
+        seq: u64,
+        thread_id: String,
+        request_id: String,
+        tool_name: String,
+        args: Value,
+    },
+    ToolResult {
+        seq: u64,
+        thread_id: String,
+        request_id: String,
+        tool_name: String,
+        result: Value,
+    },
+    ProviderCommandStarted {
+        seq: u64,
+        thread_id: String,
+        process_id: u32,
+        program: String,
+        args: Vec<String>,
+        cwd: String,
+        prompt: String,
+    },
+    ProviderSessionIdUpdated {
+        seq: u64,
+        thread_id: String,
+        provider_session_id: String,
+    },
+    Done {
+        seq: u64,
+        thread_id: String,
+    },
+    Error {
+        seq: u64,
+        thread_id: String,
+        error: PedelecError,
+    },
+    Ended {
+        seq: u64,
+        thread_id: String,
+    },
+}
+
+impl ThreadEvent {
+    pub fn seq(&self) -> u64 {
+        match self {
+            ThreadEvent::Created { seq, .. }
+            | ThreadEvent::StatusChanged { seq, .. }
+            | ThreadEvent::RawStdout { seq, .. }
+            | ThreadEvent::RawStderr { seq, .. }
+            | ThreadEvent::AssistantMessage { seq, .. }
+            | ThreadEvent::ToolCall { seq, .. }
+            | ThreadEvent::ToolResult { seq, .. }
+            | ThreadEvent::ProviderCommandStarted { seq, .. }
+            | ThreadEvent::ProviderSessionIdUpdated { seq, .. }
+            | ThreadEvent::Done { seq, .. }
+            | ThreadEvent::Error { seq, .. }
+            | ThreadEvent::Ended { seq, .. } => *seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateThreadInput {
+    pub provider: ProviderCode,
+    pub model: Option<String>,
+    pub skills_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateThreadOutput {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SendTextInput {
+    pub thread_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SendTextOutput {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EndThreadInput {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitToolResultInput {
+    pub thread_id: String,
+    pub request_id: String,
+    pub result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallInput {
+    pub thread_id: String,
+    pub tool_name: String,
+    pub args: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeThreadInput {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingToolRequest {
+    pub request_id: String,
+    pub thread_id: String,
+    pub tool_name: String,
+    pub args: Value,
+    pub created_at: DateTime<Utc>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilities {
+    pub supports_json_events: bool,
+    pub supports_resume_by_session_id: bool,
+    pub supports_user_supplied_session_id: bool,
+    pub supports_provider_generated_session_id_parse: bool,
+    pub supports_resume_last_session: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendTextStart {
+    pub output: SendTextOutput,
+    pub command: CommandSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+    pub prompt: String,
+    pub stdin: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunPromptProviderContext {
+    pub thread: ThreadState,
+    pub provider_state: ProviderAdapterState,
+    pub core_ipc_endpoint: String,
+    pub core_ipc_runtime_file_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunningProviderProcess {
+    process_id: u32,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadEventPartial {
+    AssistantMessage { text: String },
+    ProviderSessionIdUpdated { provider_session_id: String },
+    ProviderError { error: PedelecError },
+}
+
+trait ProviderAdapter {
+    fn code(&self) -> ProviderCode;
+    fn capabilities(&self) -> ProviderCapabilities;
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError>;
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError>;
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial>;
+    fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial>;
+}
+
+#[derive(Debug, Clone)]
+enum ProviderAdapterInstance {
+    Codex(CodexProviderAdapter),
+    Gemini(GeminiProviderAdapter),
+    OpenCode(OpenCodeProviderAdapter),
+    Cursor(CursorProviderAdapter),
+    Claude(ClaudeProviderAdapter),
+}
+
+impl ProviderAdapterInstance {
+    fn new(provider: ProviderCode) -> Self {
+        match provider {
+            ProviderCode::Codex => Self::Codex(CodexProviderAdapter::default()),
+            ProviderCode::Gemini => Self::Gemini(GeminiProviderAdapter::default()),
+            ProviderCode::OpenCode => Self::OpenCode(OpenCodeProviderAdapter::default()),
+            ProviderCode::Cursor => Self::Cursor(CursorProviderAdapter::default()),
+            ProviderCode::Claude => Self::Claude(ClaudeProviderAdapter::default()),
+        }
+    }
+}
+
+impl ProviderAdapter for ProviderAdapterInstance {
+    fn code(&self) -> ProviderCode {
+        match self {
+            Self::Codex(adapter) => adapter.code(),
+            Self::Gemini(adapter) => adapter.code(),
+            Self::OpenCode(adapter) => adapter.code(),
+            Self::Cursor(adapter) => adapter.code(),
+            Self::Claude(adapter) => adapter.code(),
+        }
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        match self {
+            Self::Codex(adapter) => adapter.capabilities(),
+            Self::Gemini(adapter) => adapter.capabilities(),
+            Self::OpenCode(adapter) => adapter.capabilities(),
+            Self::Cursor(adapter) => adapter.capabilities(),
+            Self::Claude(adapter) => adapter.capabilities(),
+        }
+    }
+
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        match self {
+            Self::Codex(adapter) => adapter.build_run_command(ctx, message),
+            Self::Gemini(adapter) => adapter.build_run_command(ctx, message),
+            Self::OpenCode(adapter) => adapter.build_run_command(ctx, message),
+            Self::Cursor(adapter) => adapter.build_run_command(ctx, message),
+            Self::Claude(adapter) => adapter.build_run_command(ctx, message),
+        }
+    }
+
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        match self {
+            Self::Codex(adapter) => adapter.build_resume_command(ctx, provider_session_id, message),
+            Self::Gemini(adapter) => {
+                adapter.build_resume_command(ctx, provider_session_id, message)
+            }
+            Self::OpenCode(adapter) => {
+                adapter.build_resume_command(ctx, provider_session_id, message)
+            }
+            Self::Cursor(adapter) => {
+                adapter.build_resume_command(ctx, provider_session_id, message)
+            }
+            Self::Claude(adapter) => {
+                adapter.build_resume_command(ctx, provider_session_id, message)
+            }
+        }
+    }
+
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        match self {
+            Self::Codex(adapter) => adapter.parse_stdout_event(chunk),
+            Self::Gemini(adapter) => adapter.parse_stdout_event(chunk),
+            Self::OpenCode(adapter) => adapter.parse_stdout_event(chunk),
+            Self::Cursor(adapter) => adapter.parse_stdout_event(chunk),
+            Self::Claude(adapter) => adapter.parse_stdout_event(chunk),
+        }
+    }
+
+    fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        match self {
+            Self::Codex(adapter) => adapter.parse_stderr_event(chunk),
+            Self::Gemini(adapter) => adapter.parse_stderr_event(chunk),
+            Self::OpenCode(adapter) => adapter.parse_stderr_event(chunk),
+            Self::Cursor(adapter) => adapter.parse_stderr_event(chunk),
+            Self::Claude(adapter) => adapter.parse_stderr_event(chunk),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexProviderAdapter {
+    stdout_buffer: String,
+    stderr_buffer: String,
+}
+
+impl ProviderAdapter for CodexProviderAdapter {
+    fn code(&self) -> ProviderCode {
+        ProviderCode::Codex
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_events: true,
+            supports_resume_by_session_id: true,
+            supports_user_supplied_session_id: false,
+            supports_provider_generated_session_id_parse: true,
+            supports_resume_last_session: true,
+        }
+    }
+
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        let mut args = vec![
+            "exec".to_string(),
+            "--cd".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--json".to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "-m");
+        args.push("-".to_string());
+        let prompt = build_provider_run_prompt(&ctx.thread, message);
+        Ok(CommandSpec {
+            program: "codex".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        if !self.capabilities().supports_resume_by_session_id {
+            return Err(provider_unsupported_error(
+                &ctx.thread,
+                "codex resume is not supported",
+            ));
+        }
+
+        let mut args = vec![
+            "exec".to_string(),
+            "--cd".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--json".to_string(),
+            "resume".to_string(),
+            provider_session_id.to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "-m");
+        args.push("-".to_string());
+        let prompt = build_provider_resume_prompt(message);
+        Ok(CommandSpec {
+            program: "codex".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_provider_chunk(
+            &mut self.stdout_buffer,
+            chunk,
+            find_codex_assistant_text_in_json,
+        )
+    }
+
+    fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_provider_chunk(
+            &mut self.stderr_buffer,
+            chunk,
+            find_codex_assistant_text_in_json,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GeminiProviderAdapter {
+    stdout_buffer: String,
+    stderr_buffer: String,
+}
+
+impl ProviderAdapter for GeminiProviderAdapter {
+    fn code(&self) -> ProviderCode {
+        ProviderCode::Gemini
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_events: true,
+            supports_resume_by_session_id: true,
+            supports_user_supplied_session_id: false,
+            supports_provider_generated_session_id_parse: true,
+            supports_resume_last_session: true,
+        }
+    }
+
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        let mut args = vec![
+            "--skip-trust".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        let prompt = build_provider_run_prompt(&ctx.thread, message);
+        Ok(CommandSpec {
+            program: "gemini".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        if !self.capabilities().supports_resume_by_session_id {
+            return Err(provider_unsupported_error(
+                &ctx.thread,
+                "gemini resume is not supported",
+            ));
+        }
+
+        let mut args = vec![
+            "--skip-trust".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--resume".to_string(),
+            provider_session_id.to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        let prompt = build_provider_resume_prompt(message);
+        Ok(CommandSpec {
+            program: "gemini".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_provider_chunk(
+            &mut self.stdout_buffer,
+            chunk,
+            find_gemini_assistant_text_in_json,
+        )
+    }
+
+    fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_provider_chunk(
+            &mut self.stderr_buffer,
+            chunk,
+            find_gemini_assistant_text_in_json,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenCodeProviderAdapter {
+    stdout_buffer: String,
+    stderr_buffer: String,
+}
+
+impl ProviderAdapter for OpenCodeProviderAdapter {
+    fn code(&self) -> ProviderCode {
+        ProviderCode::OpenCode
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_events: true,
+            supports_resume_by_session_id: true,
+            supports_user_supplied_session_id: false,
+            supports_provider_generated_session_id_parse: true,
+            supports_resume_last_session: false,
+        }
+    }
+
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        let mut args = vec![
+            "run".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--thinking".to_string(),
+            "--pure".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--dir".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        args.push("-".to_string());
+        let prompt = build_provider_run_prompt(&ctx.thread, message);
+        Ok(CommandSpec {
+            program: "opencode".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        if provider_session_id.trim().is_empty() {
+            return Err(provider_unsupported_error(
+                &ctx.thread,
+                "opencode resume requires a provider session id",
+            ));
+        }
+
+        let mut args = vec![
+            "run".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--thinking".to_string(),
+            "--pure".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--dir".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+            "--session".to_string(),
+            provider_session_id.to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        args.push("-".to_string());
+        let prompt = build_provider_resume_prompt(message);
+        Ok(CommandSpec {
+            program: "opencode".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_opencode_provider_chunk(&mut self.stdout_buffer, chunk)
+    }
+
+    fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_opencode_provider_chunk(&mut self.stderr_buffer, chunk)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CursorProviderAdapter {
+    stdout_buffer: String,
+    stderr_buffer: String,
+}
+
+impl ProviderAdapter for CursorProviderAdapter {
+    fn code(&self) -> ProviderCode {
+        ProviderCode::Cursor
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_events: true,
+            supports_resume_by_session_id: true,
+            supports_user_supplied_session_id: false,
+            supports_provider_generated_session_id_parse: true,
+            supports_resume_last_session: false,
+        }
+    }
+
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        let mut args = vec![
+            "--workspace".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--force".to_string(),
+            "--trust".to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        let prompt = build_provider_run_prompt(&ctx.thread, message);
+        Ok(CommandSpec {
+            program: "agent".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        if provider_session_id.trim().is_empty() {
+            return Err(provider_unsupported_error(
+                &ctx.thread,
+                "cursor resume requires a provider session id",
+            ));
+        }
+
+        let mut args = vec![
+            "--workspace".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+            "--resume".to_string(),
+            provider_session_id.to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--force".to_string(),
+            "--trust".to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        let prompt = build_provider_resume_prompt(message);
+        Ok(CommandSpec {
+            program: "agent".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_cursor_provider_chunk(&mut self.stdout_buffer, chunk)
+    }
+
+    fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_cursor_provider_chunk(&mut self.stderr_buffer, chunk)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeProviderAdapter {
+    stdout_buffer: String,
+    stderr_buffer: String,
+}
+
+impl ProviderAdapter for ClaudeProviderAdapter {
+    fn code(&self) -> ProviderCode {
+        ProviderCode::Claude
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_events: true,
+            supports_resume_by_session_id: true,
+            supports_user_supplied_session_id: false,
+            supports_provider_generated_session_id_parse: true,
+            supports_resume_last_session: true,
+        }
+    }
+
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        let prompt = build_provider_run_prompt(&ctx.thread, message);
+        Ok(CommandSpec {
+            program: "claude".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        if provider_session_id.trim().is_empty() {
+            return Err(provider_unsupported_error(
+                &ctx.thread,
+                "claude resume requires a provider session id",
+            ));
+        }
+
+        let mut args = vec![
+            "-p".to_string(),
+            "--resume".to_string(),
+            provider_session_id.to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        add_model_args(&mut args, &ctx.thread.model, "--model");
+        let prompt = build_provider_resume_prompt(message);
+        Ok(CommandSpec {
+            program: "claude".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_claude_provider_chunk(&mut self.stdout_buffer, chunk)
+    }
+
+    fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_claude_provider_chunk(&mut self.stderr_buffer, chunk)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CoreRuntime {
+    pub thread_manager: ThreadManager,
+    pub sandbox_manager: SandboxManager,
+    pub skill_manager: SkillManager,
+    pub tool_registry: ToolRegistryStore,
+    pub tool_request_broker: ToolRequestBroker,
+    pub event_bus: EventBus,
+    pub(crate) running_processes: HashMap<String, RunningProviderProcess>,
+    pub(crate) core_ipc_endpoint: Option<String>,
+    pub(crate) core_ipc_runtime_file_path: Option<PathBuf>,
+    pub(crate) settings_file_path: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) provider_path_value_override: Option<OsString>,
+    #[cfg(test)]
+    pub(crate) test_provider_command: Option<CommandSpec>,
+}
+
+impl CoreRuntime {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_core_ipc_runtime(
+        &mut self,
+        endpoint: impl Into<String>,
+        runtime_file_path: impl Into<PathBuf>,
+    ) {
+        self.core_ipc_endpoint = Some(endpoint.into());
+        self.core_ipc_runtime_file_path = Some(runtime_file_path.into());
+    }
+
+    pub fn create_thread(
+        &mut self,
+        input: CreateThreadInput,
+    ) -> Result<CreateThreadOutput, PedelecError> {
+        let thread_id = self.next_available_thread_id()?;
+        let (sandbox_path, (skills, registry)) =
+            self.sandbox_manager
+                .create_thread_sandbox_with(&thread_id, |sandbox| {
+                    let skills_dir = sandbox.join("skills");
+                    let mut skills =
+                        vec![write_builtin_pedelec_tool_skill(&skills_dir, &thread_id)?];
+                    skills.extend(
+                        self.skill_manager
+                            .download_skills(&skills_dir, &input.skills_urls)?,
+                    );
+                    let registry = ToolRegistry::load_from_skills_dir(&skills_dir)?;
+                    Ok((skills, registry))
+                })?;
+
+        let now = Utc::now();
+        let state = ThreadState {
+            thread_id: thread_id.clone(),
+            provider: input.provider,
+            model: input.model,
+            sandbox_path: sandbox_path.clone(),
+            skills,
+            status: ThreadStatus::Idle,
+            process_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.thread_manager.insert_thread(
+            state,
+            ProviderAdapterState {
+                provider_session_id: None,
+                last_process_id: None,
+            },
+        );
+        self.tool_registry.insert(thread_id.clone(), registry);
+        self.event_bus
+            .register_thread_log(&thread_id, sandbox_path.join("logs").join("events.jsonl"));
+        self.event_bus.emit_created(&thread_id);
+        self.event_bus
+            .emit_status_changed(&thread_id, ThreadStatus::Idle);
+
+        Ok(CreateThreadOutput { thread_id })
+    }
+
+    pub fn list_providers(&self) -> Vec<ProviderInfo> {
+        list_provider_infos(self.provider_path_value())
+    }
+
+    pub fn get_settings(&self) -> Result<PedelecSettings, PedelecError> {
+        read_settings_file(&self.resolved_settings_file_path()?)
+    }
+
+    pub fn update_settings(
+        &mut self,
+        input: UpdateSettingsInput,
+    ) -> Result<PedelecSettings, PedelecError> {
+        let path_value = self.provider_path_value();
+        let settings = normalize_update_settings(input, path_value.as_ref())?;
+        write_settings_file(&self.resolved_settings_file_path()?, &settings)?;
+        Ok(settings)
+    }
+
+    fn provider_path_value(&self) -> Option<OsString> {
+        #[cfg(test)]
+        if let Some(path) = &self.provider_path_value_override {
+            return Some(path.clone());
+        }
+
+        env::var_os("PATH")
+    }
+
+    fn resolved_settings_file_path(&self) -> Result<PathBuf, PedelecError> {
+        if let Some(path) = &self.settings_file_path {
+            return Ok(path.clone());
+        }
+        default_settings_file_path()
+    }
+
+    fn next_available_thread_id(&mut self) -> Result<String, PedelecError> {
+        loop {
+            let thread_id = self.thread_manager.next_thread_id()?;
+            if self.thread_manager.contains_thread(&thread_id) {
+                continue;
+            }
+            if self.sandbox_manager.thread_sandbox_exists(&thread_id)? {
+                continue;
+            }
+            return Ok(thread_id);
+        }
+    }
+
+    pub fn begin_send_text(&mut self, input: SendTextInput) -> Result<SendTextStart, PedelecError> {
+        {
+            let thread = self.thread_manager.thread(&input.thread_id)?;
+            match thread.status {
+                ThreadStatus::Running | ThreadStatus::WaitingToolResult => {
+                    return Err(PedelecError::with_details(
+                        error_codes::THREAD_BUSY,
+                        "thread is already running",
+                        serde_json::json!({ "threadId": input.thread_id }),
+                    ));
+                }
+                ThreadStatus::Ended => {
+                    return Err(PedelecError::with_details(
+                        error_codes::THREAD_ENDED,
+                        "thread has ended",
+                        serde_json::json!({ "threadId": input.thread_id }),
+                    ));
+                }
+                ThreadStatus::Error => {
+                    return Err(PedelecError::with_details(
+                        error_codes::PROVIDER_COMMAND_FAILED,
+                        "thread is in error state",
+                        serde_json::json!({ "threadId": input.thread_id }),
+                    ));
+                }
+                ThreadStatus::Stopping => {
+                    return Err(PedelecError::with_details(
+                        error_codes::THREAD_BUSY,
+                        "thread is stopping",
+                        serde_json::json!({ "threadId": input.thread_id }),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        #[cfg(test)]
+        let test_command = self.test_provider_command.clone();
+
+        #[cfg(test)]
+        let command = if let Some(command) = test_command {
+            command
+        } else {
+            self.build_send_text_command(&input)?
+        };
+
+        #[cfg(not(test))]
+        let command = self.build_send_text_command(&input)?;
+
+        let thread = self.thread_manager.thread_mut(&input.thread_id)?;
+        thread.status = ThreadStatus::Running;
+        thread.updated_at = Utc::now();
+        self.event_bus
+            .emit_status_changed(&input.thread_id, ThreadStatus::Running);
+
+        Ok(SendTextStart {
+            output: SendTextOutput {
+                thread_id: input.thread_id,
+            },
+            command,
+        })
+    }
+
+    fn build_send_text_command(
+        &mut self,
+        input: &SendTextInput,
+    ) -> Result<CommandSpec, PedelecError> {
+        let thread = self.thread_manager.thread(&input.thread_id)?.clone();
+        let provider_state = self
+            .thread_manager
+            .provider_state(&input.thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                PedelecError::with_details(
+                    error_codes::PROVIDER_NOT_FOUND,
+                    "provider state was not found for thread",
+                    serde_json::json!({ "threadId": input.thread_id }),
+                )
+            })?;
+        let ctx = RunPromptProviderContext {
+            thread,
+            provider_state: provider_state.clone(),
+            core_ipc_endpoint: self.core_ipc_endpoint.clone().unwrap_or_default(),
+            core_ipc_runtime_file_path: self
+                .core_ipc_runtime_file_path
+                .clone()
+                .unwrap_or_else(default_runtime_file_path_for_provider),
+        };
+        let adapter = self.thread_manager.provider_adapter(&input.thread_id)?;
+        if adapter.code() != ctx.thread.provider {
+            return Err(PedelecError::with_details(
+                error_codes::PROVIDER_NOT_FOUND,
+                "provider adapter does not match thread provider",
+                serde_json::json!({ "threadId": input.thread_id }),
+            ));
+        }
+
+        if let Some(provider_session_id) = provider_state.provider_session_id.as_deref() {
+            adapter.build_resume_command(&ctx, provider_session_id, &input.message)
+        } else {
+            adapter.build_run_command(&ctx, &input.message)
+        }
+    }
+
+    pub fn register_provider_process(
+        &mut self,
+        thread_id: &str,
+        process_id: u32,
+        child: Arc<Mutex<Option<Child>>>,
+    ) {
+        if let Ok(thread) = self.thread_manager.thread_mut(thread_id) {
+            thread.process_id = Some(process_id);
+            thread.updated_at = Utc::now();
+        }
+        if let Some(provider_state) = self.thread_manager.provider_state_mut(thread_id) {
+            provider_state.last_process_id = Some(process_id);
+        }
+        self.running_processes.insert(
+            thread_id.to_string(),
+            RunningProviderProcess { process_id, child },
+        );
+    }
+
+    pub fn fail_provider_process_start(&mut self, thread_id: &str, error: PedelecError) {
+        self.running_processes.remove(thread_id);
+        self.tool_request_broker.clear_thread(thread_id);
+        if let Ok(thread) = self.thread_manager.thread_mut(thread_id) {
+            thread.status = ThreadStatus::Error;
+            thread.process_id = None;
+            thread.updated_at = Utc::now();
+        }
+        self.event_bus
+            .emit_status_changed(thread_id, ThreadStatus::Error);
+        self.event_bus.emit_error(thread_id, error);
+    }
+
+    pub fn emit_provider_command_started(
+        &mut self,
+        thread_id: &str,
+        process_id: u32,
+        command: &CommandSpec,
+    ) {
+        self.event_bus
+            .emit_provider_command_started(thread_id, process_id, command);
+    }
+
+    pub fn emit_provider_stdout(&mut self, thread_id: &str, text: String) {
+        self.event_bus.emit_raw_stdout(thread_id, text.clone());
+        let events = self
+            .thread_manager
+            .provider_adapter_mut(thread_id)
+            .map(|adapter| adapter.parse_stdout_event(&text))
+            .unwrap_or_default();
+        self.emit_provider_partials(thread_id, events);
+    }
+
+    pub fn emit_provider_stderr(&mut self, thread_id: &str, text: String) {
+        self.event_bus.emit_raw_stderr(thread_id, text.clone());
+        let events = self
+            .thread_manager
+            .provider_adapter_mut(thread_id)
+            .map(|adapter| adapter.parse_stderr_event(&text))
+            .unwrap_or_default();
+        self.emit_provider_partials(thread_id, events);
+    }
+
+    pub fn complete_provider_process(
+        &mut self,
+        thread_id: &str,
+        process_id: u32,
+        status: ExitStatus,
+    ) {
+        if self
+            .running_processes
+            .get(thread_id)
+            .is_some_and(|running| running.process_id == process_id)
+        {
+            self.running_processes.remove(thread_id);
+        }
+
+        let Ok(thread) = self.thread_manager.thread_mut(thread_id) else {
+            return;
+        };
+        if thread.process_id == Some(process_id) {
+            thread.process_id = None;
+        }
+        if matches!(thread.status, ThreadStatus::Ended | ThreadStatus::Stopping) {
+            thread.updated_at = Utc::now();
+            return;
+        }
+
+        if status.success() {
+            thread.status = ThreadStatus::Idle;
+            thread.updated_at = Utc::now();
+            self.event_bus
+                .emit_status_changed(thread_id, ThreadStatus::Idle);
+        } else {
+            thread.status = ThreadStatus::Error;
+            thread.updated_at = Utc::now();
+            self.tool_request_broker.clear_thread(thread_id);
+            self.event_bus
+                .emit_status_changed(thread_id, ThreadStatus::Error);
+            self.event_bus.emit_error(
+                thread_id,
+                PedelecError::with_details(
+                    error_codes::PROVIDER_COMMAND_FAILED,
+                    "provider command failed",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "processId": process_id,
+                        "exitCode": status.code()
+                    }),
+                ),
+            );
+        }
+    }
+
+    pub fn fail_provider_process_wait(&mut self, thread_id: &str, process_id: u32, err: String) {
+        if self
+            .running_processes
+            .get(thread_id)
+            .is_some_and(|running| running.process_id == process_id)
+        {
+            self.running_processes.remove(thread_id);
+        }
+        if let Ok(thread) = self.thread_manager.thread_mut(thread_id) {
+            if thread.process_id == Some(process_id) {
+                thread.process_id = None;
+            }
+            if !matches!(thread.status, ThreadStatus::Ended | ThreadStatus::Stopping) {
+                thread.status = ThreadStatus::Error;
+                thread.updated_at = Utc::now();
+                self.event_bus
+                    .emit_status_changed(thread_id, ThreadStatus::Error);
+                self.event_bus.emit_error(
+                    thread_id,
+                    PedelecError::with_details(
+                        error_codes::PROVIDER_COMMAND_FAILED,
+                        "provider command wait failed",
+                        serde_json::json!({
+                            "threadId": thread_id,
+                            "processId": process_id,
+                            "error": err
+                        }),
+                    ),
+                );
+            }
+        }
+    }
+
+    pub fn running_process_id(&self, thread_id: &str) -> Option<u32> {
+        self.running_processes
+            .get(thread_id)
+            .map(|running| running.process_id)
+    }
+
+    pub fn running_process_count(&self) -> usize {
+        self.running_processes.len()
+    }
+
+    fn update_provider_session_id(&mut self, thread_id: &str, provider_session_id: String) {
+        let Some(provider_state) = self.thread_manager.provider_state_mut(thread_id) else {
+            return;
+        };
+        if provider_state.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
+            return;
+        }
+        provider_state.provider_session_id = Some(provider_session_id.clone());
+        self.event_bus
+            .emit_provider_session_id_updated(thread_id, provider_session_id);
+    }
+
+    fn emit_provider_partials(&mut self, thread_id: &str, events: Vec<ThreadEventPartial>) {
+        for event in events {
+            match event {
+                ThreadEventPartial::AssistantMessage { text } => {
+                    self.event_bus.emit_assistant_message(thread_id, text);
+                }
+                ThreadEventPartial::ProviderSessionIdUpdated {
+                    provider_session_id,
+                } => self.update_provider_session_id(thread_id, provider_session_id),
+                ThreadEventPartial::ProviderError { error } => {
+                    if let Ok(thread) = self.thread_manager.thread_mut(thread_id) {
+                        thread.status = ThreadStatus::Error;
+                    }
+                    self.event_bus
+                        .emit_status_changed(thread_id, ThreadStatus::Error);
+                    self.event_bus.emit_error(thread_id, error);
+                }
+            }
+        }
+    }
+
+    fn stop_running_process(&mut self, thread_id: &str) {
+        let Some(running) = self.running_processes.remove(thread_id) else {
+            return;
+        };
+
+        if let Ok(mut child) = running.child.lock() {
+            if let Some(child) = child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+
+        let _ = kill_process_by_id(running.process_id);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    pub fn end_thread(&mut self, input: EndThreadInput) -> Result<(), PedelecError> {
+        let sandbox_path = {
+            let thread = self.thread_manager.thread_mut(&input.thread_id)?;
+            if thread.status != ThreadStatus::Ended {
+                thread.status = ThreadStatus::Stopping;
+                thread.updated_at = Utc::now();
+                self.event_bus
+                    .emit_status_changed(&input.thread_id, ThreadStatus::Stopping);
+            }
+            thread.sandbox_path.clone()
+        };
+
+        self.stop_running_process(&input.thread_id);
+        self.tool_request_broker.clear_thread(&input.thread_id);
+        self.tool_registry.remove(&input.thread_id);
+
+        if let Ok(thread) = self.thread_manager.thread_mut(&input.thread_id) {
+            thread.status = ThreadStatus::Ended;
+            thread.process_id = None;
+            thread.updated_at = Utc::now();
+        }
+        self.event_bus
+            .emit_status_changed(&input.thread_id, ThreadStatus::Ended);
+        self.event_bus.emit_ended(&input.thread_id);
+        let _ = self.remove_thread_sandbox_with_retry(&sandbox_path);
+        self.event_bus.unregister_thread_log(&input.thread_id);
+        Ok(())
+    }
+
+    pub fn cleanup_for_app_exit(&mut self) -> Vec<PedelecError> {
+        let thread_ids = self.thread_manager.thread_ids();
+        for thread_id in thread_ids {
+            let _ = self.end_thread(EndThreadInput { thread_id });
+        }
+
+        self.sandbox_manager.remove_all_thread_sandboxes()
+    }
+
+    fn remove_thread_sandbox_with_retry(&self, sandbox_path: &Path) -> Result<(), PedelecError> {
+        let mut last_error = None;
+        for attempt in 0..10 {
+            match self.sandbox_manager.remove_thread_sandbox(sandbox_path) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < 9 {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            PedelecError::with_details(
+                error_codes::SANDBOX_REMOVE_FAILED,
+                "cannot remove thread sandbox",
+                serde_json::json!({ "path": sandbox_path.to_string_lossy() }),
+            )
+        }))
+    }
+
+    pub fn active_process_id(&self, thread_id: &str) -> Option<u32> {
+        self.thread_manager
+            .thread(thread_id)
+            .ok()
+            .and_then(|thread| thread.process_id)
+    }
+
+    pub fn thread_status(&self, thread_id: &str) -> Option<ThreadStatus> {
+        self.thread_manager
+            .thread(thread_id)
+            .ok()
+            .map(|thread| thread.status.clone())
+    }
+
+    pub fn provider_state(&self, thread_id: &str) -> Option<&ProviderAdapterState> {
+        self.thread_manager.provider_state(thread_id)
+    }
+
+    pub fn event_log_path(&self, thread_id: &str) -> Option<PathBuf> {
+        self.event_bus.event_log_path(thread_id)
+    }
+
+    pub fn thread_sandbox_path(&self, thread_id: &str) -> Option<PathBuf> {
+        self.thread_manager
+            .thread(thread_id)
+            .ok()
+            .map(|thread| thread.sandbox_path.clone())
+    }
+
+    pub fn begin_tool_call(
+        &mut self,
+        input: ToolCallInput,
+    ) -> Result<(String, u64, mpsc::Receiver<Value>), PedelecError> {
+        let thread = self.thread_manager.thread_mut(&input.thread_id)?;
+        match thread.status {
+            ThreadStatus::Running => {}
+            ThreadStatus::WaitingToolResult => {
+                return Err(PedelecError::with_details(
+                    error_codes::PENDING_TOOL_REQUEST_EXISTS,
+                    "thread already has a pending tool request",
+                    serde_json::json!({ "threadId": input.thread_id }),
+                ));
+            }
+            ThreadStatus::Ended => {
+                return Err(PedelecError::with_details(
+                    error_codes::THREAD_ENDED,
+                    "thread has ended",
+                    serde_json::json!({ "threadId": input.thread_id }),
+                ));
+            }
+            _ => {
+                return Err(PedelecError::with_details(
+                    error_codes::THREAD_BUSY,
+                    "thread is not running",
+                    serde_json::json!({ "threadId": input.thread_id }),
+                ));
+            }
+        }
+
+        if self
+            .tool_request_broker
+            .has_pending_for_thread(&input.thread_id)
+        {
+            return Err(PedelecError::with_details(
+                error_codes::PENDING_TOOL_REQUEST_EXISTS,
+                "thread already has a pending tool request",
+                serde_json::json!({ "threadId": input.thread_id }),
+            ));
+        }
+
+        let registry = self.tool_registry.get(&input.thread_id).ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::TOOLS_JSON_NOT_FOUND,
+                "tool registry was not found for thread",
+                serde_json::json!({ "threadId": input.thread_id }),
+            )
+        })?;
+        let normalized = registry.normalize_tool_call(&input.tool_name, &input.args)?;
+        let (request_id, receiver) = self.tool_request_broker.create_pending(
+            input.thread_id.clone(),
+            input.tool_name.clone(),
+            normalized.args.clone(),
+            normalized.timeout_ms,
+        )?;
+
+        thread.status = ThreadStatus::WaitingToolResult;
+        thread.updated_at = Utc::now();
+        self.event_bus
+            .emit_status_changed(&input.thread_id, ThreadStatus::WaitingToolResult);
+        self.event_bus.emit_tool_call(
+            &input.thread_id,
+            &request_id,
+            &input.tool_name,
+            normalized.args,
+        );
+
+        Ok((request_id, normalized.timeout_ms, receiver))
+    }
+
+    pub fn timeout_tool_call(&mut self, request_id: &str) {
+        let Some(pending) = self.tool_request_broker.remove(request_id) else {
+            return;
+        };
+        if let Ok(thread) = self.thread_manager.thread_mut(&pending.request.thread_id) {
+            if thread.status == ThreadStatus::WaitingToolResult {
+                thread.status = ThreadStatus::Running;
+                thread.updated_at = Utc::now();
+                self.event_bus
+                    .emit_status_changed(&pending.request.thread_id, ThreadStatus::Running);
+            }
+        }
+    }
+
+    pub fn submit_tool_result(&mut self, input: SubmitToolResultInput) -> Result<(), PedelecError> {
+        let pending = self
+            .tool_request_broker
+            .get(&input.request_id)
+            .ok_or_else(|| {
+                PedelecError::with_details(
+                    error_codes::PENDING_TOOL_REQUEST_NOT_FOUND,
+                    "pending tool request was not found",
+                    serde_json::json!({
+                        "threadId": input.thread_id,
+                        "requestId": input.request_id
+                    }),
+                )
+            })?;
+
+        if pending.request.thread_id != input.thread_id {
+            return Err(PedelecError::with_details(
+                error_codes::PENDING_TOOL_REQUEST_NOT_FOUND,
+                "pending tool request does not belong to thread",
+                serde_json::json!({
+                    "threadId": input.thread_id,
+                    "requestId": input.request_id
+                }),
+            ));
+        }
+
+        let pending = self
+            .tool_request_broker
+            .remove(&input.request_id)
+            .ok_or_else(|| {
+                PedelecError::with_details(
+                    error_codes::PENDING_TOOL_REQUEST_NOT_FOUND,
+                    "pending tool request was not found",
+                    serde_json::json!({
+                        "threadId": input.thread_id,
+                        "requestId": input.request_id
+                    }),
+                )
+            })?;
+
+        let _ = pending.result_tx.send(input.result.clone());
+        if let Ok(thread) = self.thread_manager.thread_mut(&input.thread_id) {
+            if thread.status == ThreadStatus::WaitingToolResult {
+                thread.status = ThreadStatus::Running;
+                thread.updated_at = Utc::now();
+                self.event_bus
+                    .emit_status_changed(&input.thread_id, ThreadStatus::Running);
+            }
+        }
+        self.event_bus.emit_tool_result(
+            &input.thread_id,
+            &input.request_id,
+            &pending.request.tool_name,
+            input.result,
+        );
+
+        Ok(())
+    }
+
+    pub fn subscribe_thread(
+        &mut self,
+        input: SubscribeThreadInput,
+    ) -> Result<mpsc::Receiver<ThreadEvent>, PedelecError> {
+        self.thread_manager.thread(&input.thread_id)?;
+        Ok(self.event_bus.subscribe(&input.thread_id))
+    }
+
+    pub fn subscribe_all_threads(&mut self) -> mpsc::Receiver<ThreadEvent> {
+        self.event_bus.subscribe_all()
+    }
+}
+
+#[derive(Debug)]
+pub struct CoreRuntimeOwner {
+    runtime: SharedCoreRuntime,
+}
+
+impl CoreRuntimeOwner {
+    pub(crate) fn new() -> Self {
+        Self {
+            runtime: Arc::new(Mutex::new(CoreRuntime::new())),
+        }
+    }
+
+    pub fn runtime(&self) -> SharedCoreRuntime {
+        Arc::clone(&self.runtime)
+    }
+}
+
+pub type SharedCoreRuntime = Arc<Mutex<CoreRuntime>>;
+
+#[derive(Debug, Default)]
+pub struct ThreadManager {
+    threads: HashMap<String, ThreadState>,
+    provider_states: HashMap<String, ProviderAdapterState>,
+    provider_adapters: HashMap<String, ProviderAdapterInstance>,
+    next_thread_number: u64,
+}
+
+impl ThreadManager {
+    fn next_thread_id(&mut self) -> Result<String, PedelecError> {
+        if self.next_thread_number >= THREAD_ID_MAX_COUNTER {
+            return Err(PedelecError::new(
+                error_codes::SANDBOX_CREATE_FAILED,
+                "thread id counter was exhausted",
+            ));
+        }
+
+        self.next_thread_number += 1;
+        let encoded = to_base36(self.next_thread_number);
+        if encoded.len() > THREAD_ID_BASE36_MAX_WIDTH {
+            return Err(PedelecError::new(
+                error_codes::SANDBOX_CREATE_FAILED,
+                "thread id counter was exhausted",
+            ));
+        }
+
+        Ok(format!(
+            "t{:0>width$}",
+            encoded,
+            width = THREAD_ID_BASE36_MIN_WIDTH
+        ))
+    }
+
+    fn contains_thread(&self, thread_id: &str) -> bool {
+        self.threads.contains_key(thread_id)
+    }
+
+    fn thread_ids(&self) -> Vec<String> {
+        self.threads.keys().cloned().collect()
+    }
+
+    pub(crate) fn insert_thread(
+        &mut self,
+        state: ThreadState,
+        provider_state: ProviderAdapterState,
+    ) {
+        let thread_id = state.thread_id.clone();
+        let provider_adapter = ProviderAdapterInstance::new(state.provider.clone());
+        self.threads.insert(thread_id.clone(), state);
+        self.provider_states
+            .insert(thread_id.clone(), provider_state);
+        self.provider_adapters.insert(thread_id, provider_adapter);
+    }
+
+    pub fn thread(&self, thread_id: &str) -> Result<&ThreadState, PedelecError> {
+        self.threads.get(thread_id).ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::THREAD_NOT_FOUND,
+                "thread was not found",
+                serde_json::json!({ "threadId": thread_id }),
+            )
+        })
+    }
+
+    pub fn thread_mut(&mut self, thread_id: &str) -> Result<&mut ThreadState, PedelecError> {
+        self.threads.get_mut(thread_id).ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::THREAD_NOT_FOUND,
+                "thread was not found",
+                serde_json::json!({ "threadId": thread_id }),
+            )
+        })
+    }
+
+    pub fn provider_state(&self, thread_id: &str) -> Option<&ProviderAdapterState> {
+        self.provider_states.get(thread_id)
+    }
+
+    fn provider_state_mut(&mut self, thread_id: &str) -> Option<&mut ProviderAdapterState> {
+        self.provider_states.get_mut(thread_id)
+    }
+
+    fn provider_adapter(&self, thread_id: &str) -> Result<&ProviderAdapterInstance, PedelecError> {
+        self.provider_adapters.get(thread_id).ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::PROVIDER_NOT_FOUND,
+                "provider adapter was not found for thread",
+                serde_json::json!({ "threadId": thread_id }),
+            )
+        })
+    }
+
+    fn provider_adapter_mut(&mut self, thread_id: &str) -> Option<&mut ProviderAdapterInstance> {
+        self.provider_adapters.get_mut(thread_id)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SandboxManager {
+    sandbox_root: Option<PathBuf>,
+}
+
+impl SandboxManager {
+    pub fn with_sandbox_root(sandbox_root: impl Into<PathBuf>) -> Self {
+        Self {
+            sandbox_root: Some(sandbox_root.into()),
+        }
+    }
+
+    pub fn thread_sandbox_exists(&self, thread_id: &str) -> Result<bool, PedelecError> {
+        let safe_thread_id = sanitize_thread_id(thread_id)?;
+        Ok(self.sandbox_root()?.join(safe_thread_id).exists())
+    }
+
+    pub fn create_thread_sandbox(&self, thread_id: &str) -> Result<PathBuf, PedelecError> {
+        let safe_thread_id = sanitize_thread_id(thread_id)?;
+        let sandbox_root = self.sandbox_root()?;
+        let sandbox_path = sandbox_root.join(safe_thread_id);
+
+        if sandbox_path.exists() {
+            return Err(PedelecError::with_details(
+                error_codes::SANDBOX_CREATE_FAILED,
+                "thread sandbox already exists",
+                serde_json::json!({ "sandboxPath": sandbox_path.to_string_lossy() }),
+            ));
+        }
+
+        let create_result = (|| {
+            fs::create_dir_all(&sandbox_path).map_err(|err| {
+                sandbox_io_error(
+                    error_codes::SANDBOX_CREATE_FAILED,
+                    "cannot create thread sandbox",
+                    &sandbox_path,
+                    err,
+                )
+            })?;
+
+            for subdir in SANDBOX_SUBDIRS {
+                let path = sandbox_path.join(subdir);
+                fs::create_dir_all(&path).map_err(|err| {
+                    sandbox_io_error(
+                        error_codes::SANDBOX_CREATE_FAILED,
+                        "cannot create thread sandbox subdirectory",
+                        &path,
+                        err,
+                    )
+                })?;
+            }
+
+            Ok(sandbox_path.clone())
+        })();
+
+        if create_result.is_err() {
+            let _ = fs::remove_dir_all(&sandbox_path);
+        }
+
+        create_result
+    }
+
+    pub fn create_thread_sandbox_with<T>(
+        &self,
+        thread_id: &str,
+        initialize: impl FnOnce(&Path) -> Result<T, PedelecError>,
+    ) -> Result<(PathBuf, T), PedelecError> {
+        let sandbox_path = self.create_thread_sandbox(thread_id)?;
+
+        match initialize(&sandbox_path) {
+            Ok(value) => Ok((sandbox_path, value)),
+            Err(err) => {
+                let _ = self.remove_thread_sandbox(&sandbox_path);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn remove_thread_sandbox(&self, sandbox_path: impl AsRef<Path>) -> Result<(), PedelecError> {
+        let sandbox_path = sandbox_path.as_ref();
+        if !sandbox_path.exists() {
+            return Ok(());
+        }
+
+        self.ensure_path_inside_sandbox_root(sandbox_path)?;
+        fs::remove_dir_all(sandbox_path).map_err(|err| {
+            sandbox_io_error(
+                error_codes::SANDBOX_REMOVE_FAILED,
+                "cannot remove thread sandbox",
+                sandbox_path,
+                err,
+            )
+        })
+    }
+
+    pub fn remove_all_thread_sandboxes(&self) -> Vec<PedelecError> {
+        let sandbox_root = match self.sandbox_root() {
+            Ok(root) => root,
+            Err(err) => return vec![err],
+        };
+        if !sandbox_root.exists() {
+            return vec![];
+        }
+
+        let entries = match fs::read_dir(&sandbox_root) {
+            Ok(entries) => entries,
+            Err(err) => {
+                return vec![sandbox_io_error(
+                    error_codes::SANDBOX_REMOVE_FAILED,
+                    "cannot read sandbox root",
+                    &sandbox_root,
+                    err,
+                )];
+            }
+        };
+
+        let mut errors = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    errors.push(sandbox_io_error(
+                        error_codes::SANDBOX_REMOVE_FAILED,
+                        "cannot read sandbox root entry",
+                        &sandbox_root,
+                        err,
+                    ));
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+            let is_dir = match entry.file_type() {
+                Ok(file_type) => file_type.is_dir(),
+                Err(err) => {
+                    errors.push(sandbox_io_error(
+                        error_codes::SANDBOX_REMOVE_FAILED,
+                        "cannot inspect sandbox root entry",
+                        &path,
+                        err,
+                    ));
+                    continue;
+                }
+            };
+            if !is_dir {
+                continue;
+            }
+
+            if let Err(err) = self.remove_thread_sandbox(&path) {
+                errors.push(err);
+            }
+        }
+
+        errors
+    }
+
+    fn sandbox_root(&self) -> Result<PathBuf, PedelecError> {
+        match &self.sandbox_root {
+            Some(root) => Ok(root.clone()),
+            None => dirs::home_dir()
+                .map(|home| home.join(".pedelec").join("sandbox"))
+                .ok_or_else(|| {
+                    PedelecError::new(
+                        error_codes::SANDBOX_PATH_INVALID,
+                        "cannot resolve user home directory for sandbox root",
+                    )
+                }),
+        }
+    }
+
+    fn ensure_path_inside_sandbox_root(&self, path: &Path) -> Result<(), PedelecError> {
+        let sandbox_root = self.sandbox_root()?;
+        let root = sandbox_root.canonicalize().map_err(|err| {
+            sandbox_io_error(
+                error_codes::SANDBOX_PATH_INVALID,
+                "cannot canonicalize sandbox root",
+                &sandbox_root,
+                err,
+            )
+        })?;
+        let target = path.canonicalize().map_err(|err| {
+            sandbox_io_error(
+                error_codes::SANDBOX_PATH_INVALID,
+                "cannot canonicalize thread sandbox",
+                path,
+                err,
+            )
+        })?;
+
+        if !target.starts_with(root) {
+            return Err(PedelecError::with_details(
+                error_codes::SANDBOX_PATH_INVALID,
+                "thread sandbox is outside sandbox root",
+                serde_json::json!({ "sandboxPath": path.to_string_lossy() }),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillManager {
+    max_file_size_bytes: u64,
+}
+
+impl Default for SkillManager {
+    fn default() -> Self {
+        Self {
+            max_file_size_bytes: DEFAULT_MAX_SKILL_SIZE_BYTES,
+        }
+    }
+}
+
+impl SkillManager {
+    pub fn with_max_file_size_bytes(max_file_size_bytes: u64) -> Self {
+        Self {
+            max_file_size_bytes,
+        }
+    }
+
+    pub fn download_skills(
+        &self,
+        skills_dir: impl AsRef<Path>,
+        skills_urls: &[String],
+    ) -> Result<Vec<SkillFile>, PedelecError> {
+        let skills_dir = skills_dir.as_ref();
+        fs::create_dir_all(skills_dir).map_err(|err| {
+            skill_download_error(
+                "cannot create skills directory",
+                None,
+                Some(skills_dir),
+                err,
+            )
+        })?;
+
+        let canonical_skills_dir = skills_dir.canonicalize().map_err(|err| {
+            skill_download_error(
+                "cannot canonicalize skills directory",
+                None,
+                Some(skills_dir),
+                err,
+            )
+        })?;
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|err| {
+                PedelecError::with_details(
+                    error_codes::SKILL_DOWNLOAD_FAILED,
+                    "cannot create skill download client",
+                    serde_json::json!({ "error": err.to_string() }),
+                )
+            })?;
+
+        let mut used_filenames = HashMap::<String, usize>::new();
+        let mut downloaded = Vec::with_capacity(skills_urls.len());
+
+        for skill_url in skills_urls {
+            let (url, original_filename, safe_filename) =
+                validate_skill_url_and_filename(skill_url)?;
+            let target_filename = unique_available_filename(
+                &safe_filename,
+                &canonical_skills_dir,
+                &mut used_filenames,
+            );
+            let target_path = canonical_skills_dir.join(&target_filename);
+            ensure_child_path(&canonical_skills_dir, &target_path)?;
+
+            let bytes = self.download_skill_bytes(&client, &url)?;
+            fs::write(&target_path, &bytes).map_err(|err| {
+                skill_download_error(
+                    "cannot write downloaded skill",
+                    Some(url.as_str()),
+                    Some(&target_path),
+                    err,
+                )
+            })?;
+
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let sha256 = format!("{:x}", hasher.finalize());
+
+            downloaded.push(SkillFile {
+                original_url: skill_url.clone(),
+                original_filename,
+                local_path: target_path,
+                sha256,
+                size_bytes: bytes.len() as u64,
+            });
+        }
+
+        Ok(downloaded)
+    }
+
+    fn download_skill_bytes(
+        &self,
+        client: &reqwest::blocking::Client,
+        url: &Url,
+    ) -> Result<Vec<u8>, PedelecError> {
+        let mut response = client.get(url.clone()).send().map_err(|err| {
+            PedelecError::with_details(
+                error_codes::SKILL_DOWNLOAD_FAILED,
+                "cannot download skill",
+                serde_json::json!({ "url": url.as_str(), "error": err.to_string() }),
+            )
+        })?;
+
+        if !response.status().is_success() {
+            return Err(PedelecError::with_details(
+                error_codes::SKILL_DOWNLOAD_FAILED,
+                "skill download returned non-success status",
+                serde_json::json!({ "url": url.as_str(), "status": response.status().as_u16() }),
+            ));
+        }
+
+        if response
+            .content_length()
+            .is_some_and(|len| len > self.max_file_size_bytes)
+        {
+            return Err(PedelecError::with_details(
+                error_codes::SKILL_DOWNLOAD_FAILED,
+                "downloaded skill exceeds size limit",
+                serde_json::json!({
+                    "url": url.as_str(),
+                    "maxSizeBytes": self.max_file_size_bytes
+                }),
+            ));
+        }
+
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(self.max_file_size_bytes + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| {
+                PedelecError::with_details(
+                    error_codes::SKILL_DOWNLOAD_FAILED,
+                    "cannot read downloaded skill",
+                    serde_json::json!({ "url": url.as_str(), "error": err.to_string() }),
+                )
+            })?;
+
+        if bytes.len() as u64 > self.max_file_size_bytes {
+            return Err(PedelecError::with_details(
+                error_codes::SKILL_DOWNLOAD_FAILED,
+                "downloaded skill exceeds size limit",
+                serde_json::json!({
+                    "url": url.as_str(),
+                    "maxSizeBytes": self.max_file_size_bytes
+                }),
+            ));
+        }
+
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub args_schema: Value,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NormalizedToolCall {
+    pub args: Value,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolRegistry {
+    tools: HashMap<String, ToolDefinition>,
+}
+
+impl ToolRegistry {
+    pub fn load_from_skills_dir(skills_dir: impl AsRef<Path>) -> Result<Self, PedelecError> {
+        let tools_json_path = skills_dir.as_ref().join("tools.json");
+        if !tools_json_path.exists() {
+            return Ok(Self::default());
+        }
+
+        let tools_json = fs::read_to_string(&tools_json_path).map_err(|err| {
+            PedelecError::with_details(
+                error_codes::TOOLS_JSON_INVALID,
+                "cannot read tools.json",
+                serde_json::json!({
+                    "path": tools_json_path.to_string_lossy(),
+                    "error": err.to_string()
+                }),
+            )
+        })?;
+        Self::from_tools_json_str(&tools_json)
+    }
+
+    pub fn from_tools_json_str(tools_json: &str) -> Result<Self, PedelecError> {
+        let raw: RawToolRegistry = serde_json::from_str(tools_json).map_err(|err| {
+            PedelecError::with_details(
+                error_codes::TOOLS_JSON_INVALID,
+                "tools.json is not valid JSON",
+                serde_json::json!({ "error": err.to_string() }),
+            )
+        })?;
+
+        let mut tools = HashMap::with_capacity(raw.tools.len());
+        for raw_tool in raw.tools {
+            if raw_tool.name.trim().is_empty() {
+                return Err(PedelecError::new(
+                    error_codes::TOOLS_JSON_INVALID,
+                    "tool name must not be empty",
+                ));
+            }
+            if tools.contains_key(&raw_tool.name) {
+                return Err(PedelecError::with_details(
+                    error_codes::TOOLS_JSON_INVALID,
+                    "duplicate tool name in tools.json",
+                    serde_json::json!({ "toolName": raw_tool.name }),
+                ));
+            }
+            jsonschema::meta::validate(&raw_tool.args_schema).map_err(|err| {
+                PedelecError::with_details(
+                    error_codes::TOOLS_JSON_INVALID,
+                    "tool argsSchema is not a valid JSON Schema",
+                    serde_json::json!({ "toolName": raw_tool.name, "error": err.to_string() }),
+                )
+            })?;
+            jsonschema::validator_for(&raw_tool.args_schema).map_err(|err| {
+                PedelecError::with_details(
+                    error_codes::TOOLS_JSON_INVALID,
+                    "tool argsSchema cannot be compiled",
+                    serde_json::json!({ "toolName": raw_tool.name, "error": err.to_string() }),
+                )
+            })?;
+
+            let timeout_ms = raw_tool.timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT_MS);
+            tools.insert(
+                raw_tool.name.clone(),
+                ToolDefinition {
+                    name: raw_tool.name,
+                    description: raw_tool.description,
+                    args_schema: raw_tool.args_schema,
+                    timeout_ms,
+                },
+            );
+        }
+
+        Ok(Self { tools })
+    }
+
+    pub fn validate_tool_call(&self, tool_name: &str, args: &Value) -> Result<u64, PedelecError> {
+        Ok(self.normalize_tool_call(tool_name, args)?.timeout_ms)
+    }
+
+    pub fn normalize_tool_call(
+        &self,
+        tool_name: &str,
+        args: &Value,
+    ) -> Result<NormalizedToolCall, PedelecError> {
+        let tool = self.tools.get(tool_name).ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::TOOL_NOT_FOUND,
+                "tool was not found in registry",
+                serde_json::json!({ "toolName": tool_name }),
+            )
+        })?;
+
+        if !args.is_object() {
+            return Err(PedelecError::with_details(
+                error_codes::TOOL_ARGS_INVALID,
+                "tool args must be a JSON object",
+                serde_json::json!({ "toolName": tool_name }),
+            ));
+        }
+
+        let schema_defines_timeout_ms =
+            tool_schema_defines_top_level_property(&tool.args_schema, TOOL_TIMEOUT_OVERRIDE_FIELD);
+        let mut normalized_args = args.clone();
+        let mut timeout_override_ms = None;
+        if let Value::Object(args_object) = &mut normalized_args {
+            if let Some(timeout_value) = args_object.get(TOOL_TIMEOUT_OVERRIDE_FIELD).cloned() {
+                timeout_override_ms = Some(parse_tool_timeout_override(tool_name, &timeout_value)?);
+                if !schema_defines_timeout_ms {
+                    args_object.remove(TOOL_TIMEOUT_OVERRIDE_FIELD);
+                }
+            }
+        }
+
+        let validator = jsonschema::validator_for(&tool.args_schema).map_err(|err| {
+            PedelecError::with_details(
+                error_codes::TOOLS_JSON_INVALID,
+                "tool argsSchema cannot be compiled",
+                serde_json::json!({ "toolName": tool_name, "error": err.to_string() }),
+            )
+        })?;
+
+        validator.validate(&normalized_args).map_err(|err| {
+            PedelecError::with_details(
+                error_codes::TOOL_ARGS_INVALID,
+                "tool args do not match schema",
+                serde_json::json!({ "toolName": tool_name, "error": err.to_string() }),
+            )
+        })?;
+
+        Ok(NormalizedToolCall {
+            args: normalized_args,
+            timeout_ms: timeout_override_ms.unwrap_or(tool.timeout_ms),
+        })
+    }
+
+    pub fn get(&self, tool_name: &str) -> Option<&ToolDefinition> {
+        self.tools.get(tool_name)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolRegistryStore {
+    registries: HashMap<String, ToolRegistry>,
+}
+
+impl ToolRegistryStore {
+    pub fn insert(&mut self, thread_id: impl Into<String>, registry: ToolRegistry) {
+        self.registries.insert(thread_id.into(), registry);
+    }
+
+    pub fn get(&self, thread_id: &str) -> Option<&ToolRegistry> {
+        self.registries.get(thread_id)
+    }
+
+    pub fn remove(&mut self, thread_id: &str) -> Option<ToolRegistry> {
+        self.registries.remove(thread_id)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawToolRegistry {
+    tools: Vec<RawToolDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawToolDefinition {
+    name: String,
+    description: String,
+    args_schema: Value,
+    timeout_ms: Option<u64>,
+}
+
+fn parse_tool_timeout_override(tool_name: &str, timeout_value: &Value) -> Result<u64, PedelecError> {
+    timeout_value
+        .as_u64()
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::TOOL_ARGS_INVALID,
+                "tool timeoutMs must be a positive integer",
+                serde_json::json!({
+                    "toolName": tool_name,
+                    "field": TOOL_TIMEOUT_OVERRIDE_FIELD
+                }),
+            )
+        })
+}
+
+fn tool_schema_defines_top_level_property(args_schema: &Value, property_name: &str) -> bool {
+    args_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key(property_name))
+}
+
+#[derive(Debug)]
+pub struct PendingToolWait {
+    pub request: PendingToolRequest,
+    result_tx: mpsc::Sender<Value>,
+}
+
+#[derive(Debug, Default)]
+pub struct ToolRequestBroker {
+    pending: HashMap<String, PendingToolWait>,
+    next_request_number: u64,
+}
+
+impl ToolRequestBroker {
+    pub fn create_pending(
+        &mut self,
+        thread_id: String,
+        tool_name: String,
+        args: Value,
+        timeout_ms: u64,
+    ) -> Result<(String, mpsc::Receiver<Value>), PedelecError> {
+        if self.has_pending_for_thread(&thread_id) {
+            return Err(PedelecError::with_details(
+                error_codes::PENDING_TOOL_REQUEST_EXISTS,
+                "thread already has a pending tool request",
+                serde_json::json!({ "threadId": thread_id }),
+            ));
+        }
+
+        self.next_request_number += 1;
+        let request_id = format!(
+            "toolreq_{}_{}",
+            Utc::now().timestamp_millis(),
+            self.next_request_number
+        );
+        let (result_tx, result_rx) = mpsc::channel();
+        let request = PendingToolRequest {
+            request_id: request_id.clone(),
+            thread_id,
+            tool_name,
+            args,
+            created_at: Utc::now(),
+            timeout_ms,
+        };
+
+        self.pending
+            .insert(request_id.clone(), PendingToolWait { request, result_tx });
+
+        Ok((request_id, result_rx))
+    }
+
+    pub fn has_pending_for_thread(&self, thread_id: &str) -> bool {
+        self.pending
+            .values()
+            .any(|pending| pending.request.thread_id == thread_id)
+    }
+
+    pub fn get(&self, request_id: &str) -> Option<&PendingToolWait> {
+        self.pending.get(request_id)
+    }
+
+    pub fn remove(&mut self, request_id: &str) -> Option<PendingToolWait> {
+        self.pending.remove(request_id)
+    }
+
+    pub fn clear_thread(&mut self, thread_id: &str) {
+        self.pending
+            .retain(|_, pending| pending.request.thread_id != thread_id);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct EventBus {
+    next_seq_by_thread: HashMap<String, u64>,
+    subscribers_by_thread: HashMap<String, Vec<mpsc::Sender<ThreadEvent>>>,
+    all_thread_subscribers: Vec<mpsc::Sender<ThreadEvent>>,
+    event_log_paths_by_thread: HashMap<String, PathBuf>,
+}
+
+impl EventBus {
+    pub fn register_thread_log(&mut self, thread_id: &str, path: PathBuf) {
+        self.event_log_paths_by_thread
+            .insert(thread_id.to_string(), path);
+    }
+
+    pub fn unregister_thread_log(&mut self, thread_id: &str) {
+        self.event_log_paths_by_thread.remove(thread_id);
+    }
+
+    pub fn event_log_path(&self, thread_id: &str) -> Option<PathBuf> {
+        self.event_log_paths_by_thread.get(thread_id).cloned()
+    }
+
+    pub fn subscribe(&mut self, thread_id: &str) -> mpsc::Receiver<ThreadEvent> {
+        let (tx, rx) = mpsc::channel();
+        self.subscribers_by_thread
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(tx);
+        rx
+    }
+
+    pub fn subscribe_all(&mut self) -> mpsc::Receiver<ThreadEvent> {
+        let (tx, rx) = mpsc::channel();
+        self.all_thread_subscribers.push(tx);
+        rx
+    }
+
+    pub fn emit_created(&mut self, thread_id: &str) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::Created {
+                seq,
+                thread_id: thread_id.to_string(),
+            },
+        );
+    }
+
+    pub fn emit_status_changed(&mut self, thread_id: &str, status: ThreadStatus) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::StatusChanged {
+                seq,
+                thread_id: thread_id.to_string(),
+                status,
+            },
+        );
+    }
+
+    pub fn emit_raw_stdout(&mut self, thread_id: &str, text: String) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::RawStdout {
+                seq,
+                thread_id: thread_id.to_string(),
+                text,
+            },
+        );
+    }
+
+    pub fn emit_raw_stderr(&mut self, thread_id: &str, text: String) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::RawStderr {
+                seq,
+                thread_id: thread_id.to_string(),
+                text,
+            },
+        );
+    }
+
+    pub fn emit_assistant_message(&mut self, thread_id: &str, text: String) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::AssistantMessage {
+                seq,
+                thread_id: thread_id.to_string(),
+                text,
+            },
+        );
+    }
+
+    pub fn emit_tool_call(
+        &mut self,
+        thread_id: &str,
+        request_id: &str,
+        tool_name: &str,
+        args: Value,
+    ) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::ToolCall {
+                seq,
+                thread_id: thread_id.to_string(),
+                request_id: request_id.to_string(),
+                tool_name: tool_name.to_string(),
+                args,
+            },
+        );
+    }
+
+    pub fn emit_tool_result(
+        &mut self,
+        thread_id: &str,
+        request_id: &str,
+        tool_name: &str,
+        result: Value,
+    ) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::ToolResult {
+                seq,
+                thread_id: thread_id.to_string(),
+                request_id: request_id.to_string(),
+                tool_name: tool_name.to_string(),
+                result,
+            },
+        );
+    }
+
+    pub fn emit_provider_command_started(
+        &mut self,
+        thread_id: &str,
+        process_id: u32,
+        command: &CommandSpec,
+    ) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::ProviderCommandStarted {
+                seq,
+                thread_id: thread_id.to_string(),
+                process_id,
+                program: command.program.clone(),
+                args: command.args.clone(),
+                cwd: command.cwd.to_string_lossy().to_string(),
+                prompt: command.prompt.clone(),
+            },
+        );
+    }
+
+    pub fn emit_provider_session_id_updated(
+        &mut self,
+        thread_id: &str,
+        provider_session_id: String,
+    ) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::ProviderSessionIdUpdated {
+                seq,
+                thread_id: thread_id.to_string(),
+                provider_session_id,
+            },
+        );
+    }
+
+    pub fn emit_error(&mut self, thread_id: &str, error: PedelecError) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::Error {
+                seq,
+                thread_id: thread_id.to_string(),
+                error,
+            },
+        );
+    }
+
+    pub fn emit_ended(&mut self, thread_id: &str) {
+        let seq = self.next_seq(thread_id);
+        self.emit(
+            thread_id,
+            ThreadEvent::Ended {
+                seq,
+                thread_id: thread_id.to_string(),
+            },
+        );
+    }
+
+    fn next_seq(&mut self, thread_id: &str) -> u64 {
+        let seq = self
+            .next_seq_by_thread
+            .entry(thread_id.to_string())
+            .or_insert(0);
+        *seq += 1;
+        *seq
+    }
+
+    fn emit(&mut self, thread_id: &str, event: ThreadEvent) {
+        self.write_event_log(thread_id, &event);
+        self.all_thread_subscribers
+            .retain(|tx| tx.send(event.clone()).is_ok());
+        if let Some(subscribers) = self.subscribers_by_thread.get_mut(thread_id) {
+            subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+        }
+    }
+
+    fn write_event_log(&self, thread_id: &str, event: &ThreadEvent) {
+        let Some(path) = self.event_log_paths_by_thread.get(thread_id) else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+
+        let record = serde_json::json!({
+            "ts": Utc::now(),
+            "seq": event.seq(),
+            "event": event,
+        });
+        let Ok(line) = serde_json::to_string(&record) else {
+            return;
+        };
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+            return;
+        };
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+pub mod error_codes {
+    pub const CORE_RUNTIME_UNAVAILABLE: &str = "CORE_RUNTIME_UNAVAILABLE";
+    pub const THREAD_NOT_FOUND: &str = "THREAD_NOT_FOUND";
+    pub const THREAD_BUSY: &str = "THREAD_BUSY";
+    pub const THREAD_ENDED: &str = "THREAD_ENDED";
+    pub const PROVIDER_NOT_FOUND: &str = "PROVIDER_NOT_FOUND";
+    pub const PROVIDER_UNSUPPORTED: &str = "PROVIDER_UNSUPPORTED";
+    pub const PROVIDER_PROCESS_START_FAILED: &str = "PROVIDER_PROCESS_START_FAILED";
+    pub const PROVIDER_PROCESS_STOP_FAILED: &str = "PROVIDER_PROCESS_STOP_FAILED";
+    pub const PROVIDER_STDIN_CLOSED: &str = "PROVIDER_STDIN_CLOSED";
+    pub const PROVIDER_COMMAND_FAILED: &str = "PROVIDER_COMMAND_FAILED";
+    pub const SKILL_URL_INVALID: &str = "SKILL_URL_INVALID";
+    pub const SKILL_DOWNLOAD_FAILED: &str = "SKILL_DOWNLOAD_FAILED";
+    pub const SANDBOX_CREATE_FAILED: &str = "SANDBOX_CREATE_FAILED";
+    pub const SANDBOX_REMOVE_FAILED: &str = "SANDBOX_REMOVE_FAILED";
+    pub const SANDBOX_PATH_INVALID: &str = "SANDBOX_PATH_INVALID";
+    pub const TOOLS_JSON_NOT_FOUND: &str = "TOOLS_JSON_NOT_FOUND";
+    pub const TOOLS_JSON_INVALID: &str = "TOOLS_JSON_INVALID";
+    pub const TOOLS_MD_NOT_FOUND: &str = "TOOLS_MD_NOT_FOUND";
+    pub const TOOL_NOT_FOUND: &str = "TOOL_NOT_FOUND";
+    pub const TOOL_ARGS_INVALID: &str = "TOOL_ARGS_INVALID";
+    pub const TOOL_TIMEOUT: &str = "TOOL_TIMEOUT";
+    pub const PENDING_TOOL_REQUEST_EXISTS: &str = "PENDING_TOOL_REQUEST_EXISTS";
+    pub const PENDING_TOOL_REQUEST_NOT_FOUND: &str = "PENDING_TOOL_REQUEST_NOT_FOUND";
+    pub const IPC_UNAVAILABLE: &str = "IPC_UNAVAILABLE";
+    pub const IPC_UNAUTHORIZED: &str = "IPC_UNAUTHORIZED";
+    pub const MESSAGE_TOO_LARGE: &str = "MESSAGE_TOO_LARGE";
+    pub const NATIVE_CONNECTION_CLOSED: &str = "NATIVE_CONNECTION_CLOSED";
+    pub const DEFAULT_PROVIDER_NOT_SET: &str = "DEFAULT_PROVIDER_NOT_SET";
+    pub const DEFAULT_PROVIDER_UNAVAILABLE: &str = "DEFAULT_PROVIDER_UNAVAILABLE";
+    pub const SETTINGS_READ_FAILED: &str = "SETTINGS_READ_FAILED";
+    pub const SETTINGS_WRITE_FAILED: &str = "SETTINGS_WRITE_FAILED";
+}
+
+fn provider_code_as_str(provider: &ProviderCode) -> &'static str {
+    match provider {
+        ProviderCode::Codex => "codex",
+        ProviderCode::Gemini => "gemini",
+        ProviderCode::OpenCode => "opencode",
+        ProviderCode::Cursor => "cursor",
+        ProviderCode::Claude => "claude",
+    }
+}
+
+fn provider_display_name(provider: &ProviderCode) -> &'static str {
+    match provider {
+        ProviderCode::Codex => "Codex",
+        ProviderCode::Gemini => "Gemini",
+        ProviderCode::OpenCode => "OpenCode",
+        ProviderCode::Cursor => "Cursor",
+        ProviderCode::Claude => "Claude Code",
+    }
+}
+
+fn provider_program_name(provider: &ProviderCode) -> &'static str {
+    match provider {
+        ProviderCode::Codex => "codex",
+        ProviderCode::Gemini => "gemini",
+        ProviderCode::OpenCode => "opencode",
+        ProviderCode::Cursor => "agent",
+        ProviderCode::Claude => "claude",
+    }
+}
+
+fn list_provider_infos(path_value: Option<OsString>) -> Vec<ProviderInfo> {
+    [
+        ProviderCode::Codex,
+        ProviderCode::Gemini,
+        ProviderCode::OpenCode,
+        ProviderCode::Cursor,
+        ProviderCode::Claude,
+    ]
+    .into_iter()
+    .map(|provider| provider_info_for(provider, path_value.as_ref()))
+    .collect()
+}
+
+fn provider_info_for(provider: ProviderCode, path_value: Option<&OsString>) -> ProviderInfo {
+    let program = provider_program_name(&provider);
+    match resolve_provider_binary_for_list(program, path_value) {
+        Ok(path) => ProviderInfo {
+            name: provider_display_name(&provider).to_string(),
+            code: provider,
+            path: Some(path.to_string_lossy().to_string()),
+            available: true,
+            error: None,
+        },
+        Err(error) => ProviderInfo {
+            name: provider_display_name(&provider).to_string(),
+            code: provider,
+            path: None,
+            available: false,
+            error: Some(error),
+        },
+    }
+}
+
+fn normalize_update_settings(
+    input: UpdateSettingsInput,
+    path_value: Option<&OsString>,
+) -> Result<PedelecSettings, PedelecError> {
+    let provider_info = provider_info_for(input.default_provider.clone(), path_value);
+    if !provider_info.available {
+        return Err(PedelecError::with_details(
+            error_codes::DEFAULT_PROVIDER_UNAVAILABLE,
+            "default provider is not currently available",
+            serde_json::json!({
+                "provider": provider_code_as_str(&input.default_provider),
+                "error": provider_info.error
+            }),
+        ));
+    }
+
+    let default_model = input
+        .default_model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty());
+
+    Ok(PedelecSettings {
+        default_provider: Some(input.default_provider),
+        default_model,
+    })
+}
+
+fn default_settings_file_path() -> Result<PathBuf, PedelecError> {
+    crate::pedelec_paths::pedelec_home_dir().map(|home| home.join("settings.json"))
+}
+
+fn read_settings_file(path: &Path) -> Result<PedelecSettings, PedelecError> {
+    if !path.exists() {
+        return Ok(PedelecSettings::default());
+    }
+
+    let content = fs::read_to_string(path).map_err(|err| {
+        PedelecError::with_details(
+            error_codes::SETTINGS_READ_FAILED,
+            "cannot read Pedelec settings",
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "error": err.to_string()
+            }),
+        )
+    })?;
+
+    serde_json::from_str(&content).map_err(|err| {
+        PedelecError::with_details(
+            error_codes::SETTINGS_READ_FAILED,
+            "Pedelec settings file was not valid JSON",
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "error": err.to_string()
+            }),
+        )
+    })
+}
+
+fn write_settings_file(path: &Path, settings: &PedelecSettings) -> Result<(), PedelecError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            PedelecError::with_details(
+                error_codes::SETTINGS_WRITE_FAILED,
+                "cannot create Pedelec settings directory",
+                serde_json::json!({
+                    "path": parent.to_string_lossy(),
+                    "error": err.to_string()
+                }),
+            )
+        })?;
+    }
+
+    let content = serde_json::to_string_pretty(settings).map_err(|err| {
+        PedelecError::with_details(
+            error_codes::SETTINGS_WRITE_FAILED,
+            "cannot serialize Pedelec settings",
+            serde_json::json!({ "error": err.to_string() }),
+        )
+    })?;
+
+    fs::write(path, content).map_err(|err| {
+        PedelecError::with_details(
+            error_codes::SETTINGS_WRITE_FAILED,
+            "cannot write Pedelec settings",
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "error": err.to_string()
+            }),
+        )
+    })
+}
+
+fn resolve_provider_binary_for_list(
+    program: &str,
+    path_value: Option<&OsString>,
+) -> Result<PathBuf, String> {
+    let Some(path_value) = path_value else {
+        return Err("PATH was not available".to_string());
+    };
+
+    let path_dirs = env::split_paths(path_value).collect::<Vec<_>>();
+    let candidates = provider_binary_lookup_candidates(program, &path_dirs);
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "program was not found in PATH".to_string())
+}
+
+fn provider_binary_lookup_candidates(program: &str, path_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let program_path = Path::new(program);
+        if program_path.extension().is_some() {
+            return path_dirs.iter().map(|dir| dir.join(program)).collect();
+        }
+
+        return ["", ".exe", ".cmd", ".bat"]
+            .iter()
+            .flat_map(|extension| {
+                path_dirs
+                    .iter()
+                    .map(move |dir| dir.join(format!("{program}{extension}")))
+            })
+            .collect();
+    }
+
+    #[cfg(not(windows))]
+    {
+        path_dirs.iter().map(|dir| dir.join(program)).collect()
+    }
+}
+
+fn add_model_args(args: &mut Vec<String>, model: &Option<String>, flag: &str) {
+    if let Some(model) = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        args.push(flag.to_string());
+        args.push(model.to_string());
+    }
+}
+
+fn build_provider_env(
+    ctx: &RunPromptProviderContext,
+) -> Result<Vec<(String, String)>, PedelecError> {
+    let provider = provider_code_as_str(&ctx.thread.provider).to_string();
+    let mut env = vec![
+        ("PEDELEC_THREAD_ID".to_string(), ctx.thread.thread_id.clone()),
+        ("PEDELEC_PROVIDER".to_string(), provider),
+        (
+            "PEDELEC_SANDBOX_PATH".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+        ),
+        (
+            "PEDELEC_CORE_IPC_ENDPOINT".to_string(),
+            ctx.core_ipc_endpoint.clone(),
+        ),
+        (
+            "PEDELEC_CORE_IPC_RUNTIME_FILE".to_string(),
+            ctx.core_ipc_runtime_file_path.to_string_lossy().to_string(),
+        ),
+    ];
+    if let Some(model) = &ctx.thread.model {
+        env.push(("PEDELEC_MODEL".to_string(), model.clone()));
+    }
+    env.push((
+        "PATH".to_string(),
+        crate::pedelec_paths::path_value_with_default_pedelec_dir()?
+            .to_string_lossy()
+            .to_string(),
+    ));
+    Ok(env)
+}
+
+fn build_provider_run_prompt(thread: &ThreadState, message: &str) -> String {
+    format!("{}{message}", build_provider_instruction(thread))
+}
+
+fn build_provider_resume_prompt(message: &str) -> String {
+    message.to_string()
+}
+
+fn build_provider_instruction(thread: &ThreadState) -> String {
+    let has_tools_md = thread.skills.iter().any(|skill| {
+        skill.local_path.file_name().and_then(|name| name.to_str()) == Some("tools.md")
+    });
+    let app_tools_instruction = if has_tools_md {
+        format!("[Hard Rules]\n\
+1. Before reading or modifying any local files outside the sandbox: \"{}\", you must ask me for permission first.\n\
+2. You have full permissions to view all files under \"./skills/\" and to use pedelec-cli, neither of which requires you to be prompted.\n\
+3. You must now read \"./skills/tools.md\" inside the sandbox.\n\
+4. Your task is to respond to blocks below \"[User Message]\" to complete the task. Pedelec-tools should be used preferentially when executing the task.
+5. If you don't understand the User question, first look at all the files under \"./skills/\" to understand the context.
+\n\
+[pedelec-cli]\n\
+This environment needs to communicate with the frontend through pedelec-cli.\n\
+For how to use pedelec-cli, refer to: \"./skills/pedelec-cli.md\" inside the sandbox.\n\
+------\n\n[User Message]\n", thread.sandbox_path.to_string_lossy())
+    } else {
+        "".to_string()
+    };
+    app_tools_instruction.to_string()
+}
+
+fn default_runtime_file_path_for_provider() -> PathBuf {
+    crate::pedelec_paths::pedelec_home_dir()
+        .map(|home| home.join("runtime.json"))
+        .unwrap_or_else(|_| PathBuf::from("runtime.json"))
+}
+
+fn provider_unsupported_error(thread: &ThreadState, message: &str) -> PedelecError {
+    PedelecError::with_details(
+        error_codes::PROVIDER_UNSUPPORTED,
+        message,
+        serde_json::json!({
+            "threadId": thread.thread_id,
+            "provider": provider_code_as_str(&thread.provider)
+        }),
+    )
+}
+
+fn parse_provider_chunk(
+    buffer: &mut String,
+    chunk: &str,
+    find_assistant_text: fn(&Value) -> Option<String>,
+) -> Vec<ThreadEventPartial> {
+    buffer.push_str(chunk);
+    let mut events: Vec<ThreadEventPartial> = Vec::new();
+
+    while let Some(newline_index) = buffer.find('\n') {
+        let mut line = buffer[..newline_index].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        buffer.drain(..=newline_index);
+        events.extend(parse_provider_line(&line, find_assistant_text));
+    }
+
+    if buffer.len() > 64 * 1024 {
+        buffer.clear();
+    }
+
+    events
+}
+
+fn parse_opencode_provider_chunk(buffer: &mut String, chunk: &str) -> Vec<ThreadEventPartial> {
+    buffer.push_str(chunk);
+    let mut events: Vec<ThreadEventPartial> = Vec::new();
+
+    while let Some(newline_index) = buffer.find('\n') {
+        let mut line = buffer[..newline_index].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        buffer.drain(..=newline_index);
+        events.extend(parse_opencode_provider_line(&line));
+    }
+
+    if buffer.len() > 64 * 1024 {
+        buffer.clear();
+        events.push(ThreadEventPartial::ProviderError {
+            error: PedelecError::new(
+                error_codes::PROVIDER_COMMAND_FAILED,
+                "opencode emitted an unterminated JSON event",
+            ),
+        });
+    }
+
+    events
+}
+
+fn parse_cursor_provider_chunk(buffer: &mut String, chunk: &str) -> Vec<ThreadEventPartial> {
+    buffer.push_str(chunk);
+    let mut events: Vec<ThreadEventPartial> = Vec::new();
+
+    while let Some(newline_index) = buffer.find('\n') {
+        let mut line = buffer[..newline_index].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        buffer.drain(..=newline_index);
+        events.extend(parse_cursor_provider_line(&line));
+    }
+
+    if buffer.len() > 64 * 1024 {
+        buffer.clear();
+        events.push(ThreadEventPartial::ProviderError {
+            error: PedelecError::new(
+                error_codes::PROVIDER_COMMAND_FAILED,
+                "cursor emitted an unterminated JSON event",
+            ),
+        });
+    }
+
+    events
+}
+
+fn parse_claude_provider_chunk(buffer: &mut String, chunk: &str) -> Vec<ThreadEventPartial> {
+    buffer.push_str(chunk);
+    let mut events: Vec<ThreadEventPartial> = Vec::new();
+
+    while let Some(newline_index) = buffer.find('\n') {
+        let mut line = buffer[..newline_index].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        buffer.drain(..=newline_index);
+        events.extend(parse_claude_provider_line(&line));
+    }
+
+    if buffer.len() > 64 * 1024 {
+        buffer.clear();
+        events.push(ThreadEventPartial::ProviderError {
+            error: PedelecError::new(
+                error_codes::PROVIDER_COMMAND_FAILED,
+                "claude emitted an unterminated JSON event",
+            ),
+        });
+    }
+
+    events
+}
+
+fn parse_opencode_provider_line(line: &str) -> Vec<ThreadEventPartial> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return Vec::new();
+    }
+
+    let value = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            return vec![ThreadEventPartial::ProviderError {
+                error: PedelecError::with_details(
+                    error_codes::PROVIDER_COMMAND_FAILED,
+                    "opencode emitted invalid JSON",
+                    serde_json::json!({ "error": err.to_string() }),
+                ),
+            }]
+        }
+    };
+
+    let mut events = Vec::new();
+    if let Some(provider_session_id) = find_opencode_session_id_in_json(&value) {
+        events.push(ThreadEventPartial::ProviderSessionIdUpdated {
+            provider_session_id,
+        });
+    }
+    if let Some(text) = find_opencode_assistant_text_in_json(&value) {
+        events.push(ThreadEventPartial::AssistantMessage { text });
+    }
+    events
+}
+
+fn parse_cursor_provider_line(line: &str) -> Vec<ThreadEventPartial> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return Vec::new();
+    }
+
+    let value = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            return vec![ThreadEventPartial::ProviderError {
+                error: PedelecError::with_details(
+                    error_codes::PROVIDER_COMMAND_FAILED,
+                    "cursor emitted invalid JSON",
+                    serde_json::json!({ "error": err.to_string() }),
+                ),
+            }]
+        }
+    };
+
+    let mut events = Vec::new();
+    if let Some(provider_session_id) = find_cursor_session_id_in_json(&value) {
+        events.push(ThreadEventPartial::ProviderSessionIdUpdated {
+            provider_session_id,
+        });
+    }
+    if let Some(text) = find_cursor_assistant_text_in_json(&value) {
+        events.push(ThreadEventPartial::AssistantMessage { text });
+    }
+    events
+}
+
+fn parse_claude_provider_line(line: &str) -> Vec<ThreadEventPartial> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return Vec::new();
+    }
+
+    let value = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            return vec![ThreadEventPartial::ProviderError {
+                error: PedelecError::with_details(
+                    error_codes::PROVIDER_COMMAND_FAILED,
+                    "claude emitted invalid JSON",
+                    serde_json::json!({ "error": err.to_string() }),
+                ),
+            }]
+        }
+    };
+
+    let mut events = Vec::new();
+    if let Some(provider_session_id) = find_claude_session_id_in_json(&value) {
+        events.push(ThreadEventPartial::ProviderSessionIdUpdated {
+            provider_session_id,
+        });
+    }
+    if let Some(text) = find_claude_assistant_text_in_json(&value) {
+        events.push(ThreadEventPartial::AssistantMessage { text });
+    }
+    events
+}
+
+fn parse_provider_line(
+    line: &str,
+    find_assistant_text: fn(&Value) -> Option<String>,
+) -> Vec<ThreadEventPartial> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(provider_session_id) = find_provider_session_id_in_json(&value) {
+                events.push(ThreadEventPartial::ProviderSessionIdUpdated {
+                    provider_session_id,
+                });
+            }
+            if let Some(text) = find_assistant_text(&value) {
+                events.push(ThreadEventPartial::AssistantMessage { text });
+            }
+            return events;
+        }
+    }
+
+    if let Some(provider_session_id) = find_provider_session_id_in_text(trimmed) {
+        events.push(ThreadEventPartial::ProviderSessionIdUpdated {
+            provider_session_id,
+        });
+    }
+    events
+}
+
+fn find_provider_session_id_in_json(value: &Value) -> Option<String> {
+    if let Some(provider_session_id) = find_codex_thread_started_id(value) {
+        return Some(provider_session_id);
+    }
+
+    find_string_for_keys(
+        value,
+        &[
+            "sessionId",
+            "session_id",
+            "conversationId",
+            "conversation_id",
+        ],
+    )
+    .filter(|value| !value.trim().is_empty())
+}
+
+fn find_opencode_session_id_in_json(value: &Value) -> Option<String> {
+    if let Some(id) = find_string_for_keys(
+        value,
+        &[
+            "sessionId",
+            "session_id",
+            "conversationId",
+            "conversation_id",
+            "sessionID",
+        ],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    {
+        return Some(id);
+    }
+
+    let object = value.as_object()?;
+    let event_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if event_type.contains("session") {
+        return object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    None
+}
+
+fn find_cursor_session_id_in_json(value: &Value) -> Option<String> {
+    find_string_for_keys(
+        value,
+        &[
+            "sessionId",
+            "session_id",
+            "conversationId",
+            "conversation_id",
+            "sessionID",
+        ],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+fn find_claude_session_id_in_json(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    if object.get("type").and_then(Value::as_str) != Some("system") {
+        return None;
+    }
+    if object.get("subtype").and_then(Value::as_str) != Some("init") {
+        return None;
+    }
+
+    object
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn find_codex_thread_started_id(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    if object.get("type").and_then(Value::as_str) != Some("thread.started") {
+        return None;
+    }
+
+    object
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn find_codex_assistant_text_in_json(value: &Value) -> Option<String> {
+    find_string_for_keys(value, &["text", "content", "message"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn find_gemini_assistant_text_in_json(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if map.get("role").and_then(Value::as_str).map(str::trim) == Some("assistant") {
+                if let Some(text) = find_string_for_keys(value, &["text", "content", "message"])
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(text);
+                }
+            }
+
+            map.values().find_map(find_gemini_assistant_text_in_json)
+        }
+        Value::Array(values) => values.iter().find_map(find_gemini_assistant_text_in_json),
+        _ => None,
+    }
+}
+
+fn find_opencode_assistant_text_in_json(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            let role = map
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_ascii_lowercase);
+            let event_type = map
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_assistant = role.as_deref() == Some("assistant")
+                || event_type.contains("assistant")
+                || event_type.contains("message")
+                || event_type.contains("text")
+                || event_type.contains("part");
+
+            if is_assistant {
+                if let Some(text) =
+                    find_string_for_keys(value, &["delta", "text", "content", "message", "output"])
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                {
+                    return Some(text);
+                }
+            }
+
+            map.values().find_map(find_opencode_assistant_text_in_json)
+        }
+        Value::Array(values) => values.iter().find_map(find_opencode_assistant_text_in_json),
+        _ => None,
+    }
+}
+
+fn find_cursor_assistant_text_in_json(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str).map(str::trim) == Some("assistant") {
+                if let Some(text) =
+                    find_string_for_keys(value, &["delta", "text", "content", "message", "output"])
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                {
+                    return Some(text);
+                }
+            }
+
+            map.values().find_map(find_cursor_assistant_text_in_json)
+        }
+        Value::Array(values) => values.iter().find_map(find_cursor_assistant_text_in_json),
+        _ => None,
+    }
+}
+
+fn find_claude_assistant_text_in_json(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            let role = map.get("role").and_then(Value::as_str).map(str::trim);
+            let event_type = map.get("type").and_then(Value::as_str).map(str::trim);
+            let is_assistant = role == Some("assistant") || event_type == Some("assistant");
+
+            if is_assistant {
+                if let Some(text) =
+                    find_string_for_keys(value, &["text", "content", "message", "delta", "output"])
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                {
+                    return Some(text);
+                }
+            }
+
+            map.values().find_map(find_claude_assistant_text_in_json)
+        }
+        Value::Array(values) => values.iter().find_map(find_claude_assistant_text_in_json),
+        _ => None,
+    }
+}
+
+fn find_string_for_keys(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if keys.iter().any(|candidate| key == candidate) {
+                    if let Some(value) = value.as_str() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+            map.values()
+                .find_map(|value| find_string_for_keys(value, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_string_for_keys(value, keys)),
+        _ => None,
+    }
+}
+
+fn find_provider_session_id_in_text(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    if !(lower.contains("session") || lower.contains("conversation")) {
+        return None;
+    }
+
+    line.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .find(|token| is_uuid_like_token(token))
+        .map(ToOwned::to_owned)
+}
+
+fn is_uuid_like_token(token: &str) -> bool {
+    token.len() >= 8
+        && token.chars().any(|ch| ch == '-')
+        && token.chars().any(|ch| ch.is_ascii_digit())
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn kill_process_by_id(process_id: u32) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("taskkill")
+            .args(["/PID", &process_id.to_string(), "/T", "/F"])
+            .status()
+            .map(|_| ())
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("kill")
+            .args(["-TERM", &process_id.to_string()])
+            .status()
+            .map(|_| ())
+    }
+}
+
+fn to_base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    if value == 0 {
+        return "0".to_string();
+    }
+
+    let mut encoded = Vec::new();
+    while value > 0 {
+        encoded.push(DIGITS[(value % 36) as usize] as char);
+        value /= 36;
+    }
+    encoded.iter().rev().collect()
+}
+
+fn sanitize_thread_id(thread_id: &str) -> Result<String, PedelecError> {
+    if thread_id.is_empty()
+        || thread_id.len() > 128
+        || !thread_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(PedelecError::with_details(
+            error_codes::SANDBOX_PATH_INVALID,
+            "thread id is not safe for sandbox path",
+            serde_json::json!({ "threadId": thread_id }),
+        ));
+    }
+
+    Ok(thread_id.to_string())
+}
+
+fn validate_skill_url_and_filename(skill_url: &str) -> Result<(Url, String, String), PedelecError> {
+    let lower_url = skill_url.to_ascii_lowercase();
+    if lower_url.contains("/../")
+        || lower_url.contains("/./")
+        || lower_url.ends_with("/..")
+        || lower_url.ends_with("/.")
+        || lower_url.contains("%2e%2e")
+        || lower_url.contains("%2e/")
+    {
+        return Err(PedelecError::with_details(
+            error_codes::SKILL_URL_INVALID,
+            "skill URL path contains traversal syntax",
+            serde_json::json!({ "url": skill_url }),
+        ));
+    }
+
+    let url = Url::parse(skill_url).map_err(|err| {
+        PedelecError::with_details(
+            error_codes::SKILL_URL_INVALID,
+            "skill URL is invalid",
+            serde_json::json!({ "url": skill_url, "error": err.to_string() }),
+        )
+    })?;
+
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(&url) => {}
+        _ => {
+            return Err(PedelecError::with_details(
+                error_codes::SKILL_URL_INVALID,
+                "skill URL scheme or host is not allowed",
+                serde_json::json!({ "url": skill_url }),
+            ));
+        }
+    }
+
+    let mut original_filename = None;
+    let segments = url.path_segments().ok_or_else(|| {
+        PedelecError::with_details(
+            error_codes::SKILL_URL_INVALID,
+            "skill URL must have path segments",
+            serde_json::json!({ "url": skill_url }),
+        )
+    })?;
+
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." || segment.contains('\\') || segment.contains('/') {
+            return Err(PedelecError::with_details(
+                error_codes::SKILL_URL_INVALID,
+                "skill URL path contains unsafe segments",
+                serde_json::json!({ "url": skill_url }),
+            ));
+        }
+        original_filename = Some(segment.to_string());
+    }
+
+    let original_filename = original_filename.ok_or_else(|| {
+        PedelecError::with_details(
+            error_codes::SKILL_URL_INVALID,
+            "skill URL must include a filename",
+            serde_json::json!({ "url": skill_url }),
+        )
+    })?;
+
+    let safe_filename = sanitize_filename(&original_filename).ok_or_else(|| {
+        PedelecError::with_details(
+            error_codes::SKILL_URL_INVALID,
+            "skill filename is not safe",
+            serde_json::json!({ "url": skill_url, "filename": original_filename }),
+        )
+    })?;
+
+    Ok((url, original_filename, safe_filename))
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    matches!(
+        url.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
+    )
+}
+
+fn sanitize_filename(filename: &str) -> Option<String> {
+    let sanitized: String = filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('.').to_string();
+
+    if sanitized.is_empty()
+        || sanitized == "."
+        || sanitized == ".."
+        || sanitized.contains('/')
+        || sanitized.contains('\\')
+    {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn unique_filename(safe_filename: &str, used_filenames: &mut HashMap<String, usize>) -> String {
+    let count = used_filenames.entry(safe_filename.to_string()).or_insert(0);
+    let filename = if *count == 0 {
+        safe_filename.to_string()
+    } else {
+        let path = Path::new(safe_filename);
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(safe_filename);
+        let extension = path.extension().and_then(|extension| extension.to_str());
+
+        match extension {
+            Some(extension) if !extension.is_empty() => format!("{stem}_{count}.{extension}"),
+            _ => format!("{safe_filename}_{count}"),
+        }
+    };
+    *count += 1;
+    filename
+}
+
+fn unique_available_filename(
+    safe_filename: &str,
+    directory: &Path,
+    used_filenames: &mut HashMap<String, usize>,
+) -> String {
+    loop {
+        let filename = unique_filename(safe_filename, used_filenames);
+        if !directory.join(&filename).exists() {
+            return filename;
+        }
+    }
+}
+
+fn write_builtin_pedelec_tool_skill(
+    skills_dir: impl AsRef<Path>,
+    thread_id: &str,
+) -> Result<SkillFile, PedelecError> {
+    let skills_dir = skills_dir.as_ref();
+    fs::create_dir_all(skills_dir).map_err(|err| {
+        skill_download_error(
+            "cannot create skills directory",
+            None,
+            Some(skills_dir),
+            err,
+        )
+    })?;
+
+    let canonical_skills_dir = skills_dir.canonicalize().map_err(|err| {
+        skill_download_error(
+            "cannot canonicalize skills directory",
+            None,
+            Some(skills_dir),
+            err,
+        )
+    })?;
+    let target_path = canonical_skills_dir.join(BUILTIN_PEDELEC_TOOL_FILENAME);
+    ensure_child_path(&canonical_skills_dir, &target_path)?;
+
+    let content = BUILTIN_PEDELEC_TOOL_TEMPLATE.replace("<thread_id>", thread_id);
+    fs::write(&target_path, content.as_bytes()).map_err(|err| {
+        skill_download_error(
+            "cannot write builtin pedelec tool skill",
+            Some(BUILTIN_PEDELEC_TOOL_ORIGINAL_URL),
+            Some(&target_path),
+            err,
+        )
+    })?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    Ok(SkillFile {
+        original_url: BUILTIN_PEDELEC_TOOL_ORIGINAL_URL.to_string(),
+        original_filename: BUILTIN_PEDELEC_TOOL_FILENAME.to_string(),
+        local_path: target_path,
+        sha256,
+        size_bytes: content.len() as u64,
+    })
+}
+
+fn ensure_child_path(parent: &Path, child: &Path) -> Result<(), PedelecError> {
+    for component in child.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(PedelecError::with_details(
+                error_codes::SKILL_URL_INVALID,
+                "skill target path contains parent directory traversal",
+                serde_json::json!({ "path": child.to_string_lossy() }),
+            ));
+        }
+    }
+
+    if !child.starts_with(parent) {
+        return Err(PedelecError::with_details(
+            error_codes::SKILL_URL_INVALID,
+            "skill target path is outside skills directory",
+            serde_json::json!({ "path": child.to_string_lossy() }),
+        ));
+    }
+
+    Ok(())
+}
+
+fn sandbox_io_error(
+    code: &'static str,
+    message: &'static str,
+    path: &Path,
+    err: std::io::Error,
+) -> PedelecError {
+    PedelecError::with_details(
+        code,
+        message,
+        serde_json::json!({ "path": path.to_string_lossy(), "error": err.to_string() }),
+    )
+}
+
+fn skill_download_error(
+    message: &'static str,
+    url: Option<&str>,
+    path: Option<&Path>,
+    err: std::io::Error,
+) -> PedelecError {
+    PedelecError::with_details(
+        error_codes::SKILL_DOWNLOAD_FAILED,
+        message,
+        serde_json::json!({
+            "url": url,
+            "path": path.map(|path| path.to_string_lossy().to_string()),
+            "error": err.to_string()
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn provider_code_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(ProviderCode::Codex).unwrap(),
+            json!("codex")
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderCode::Gemini).unwrap(),
+            json!("gemini")
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderCode::OpenCode).unwrap(),
+            json!("opencode")
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderCode::Cursor).unwrap(),
+            json!("cursor")
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderCode::Claude).unwrap(),
+            json!("claude")
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderCode>(json!("cursor")).unwrap(),
+            ProviderCode::Cursor
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderCode>(json!("claude")).unwrap(),
+            ProviderCode::Claude
+        );
+    }
+
+    #[test]
+    fn codex_new_command_uses_sandbox_args_env_prompt_and_no_generated_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_codex_new",
+            ProviderCode::Codex,
+            None,
+            Some("gpt-5".into()),
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_codex_new".into(),
+                message: "hello".into(),
+            })
+            .unwrap();
+
+        assert_eq!(start.command.program, "codex");
+        let sandbox_path = temp.path().join("sandbox").join("thread_codex_new");
+        assert_eq!(
+            start.command.args,
+            vec![
+                "exec",
+                "--cd",
+                sandbox_path.to_str().unwrap(),
+                "--sandbox",
+                "danger-full-access",
+                "--skip-git-repo-check",
+                "--json",
+                "-m",
+                "gpt-5",
+                "-"
+            ]
+        );
+        assert_eq!(start.command.cwd, sandbox_path);
+        assert!(!start.command.args.iter().any(|arg| arg == "--last"));
+        assert_provider_instruction_present(&start.command);
+        assert!(start.command.stdin.ends_with("hello"));
+        assert_env(&start.command, "PEDELEC_THREAD_ID", "thread_codex_new");
+        assert_env(&start.command, "PEDELEC_PROVIDER", "codex");
+        assert_env(
+            &start.command,
+            "PEDELEC_CORE_IPC_ENDPOINT",
+            "127.0.0.1:12345",
+        );
+        assert!(env_value(&start.command, "PATH")
+            .unwrap()
+            .contains(".pedelec"));
+    }
+
+    #[test]
+    fn codex_resume_uses_explicit_session_id_and_not_last() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_codex_resume",
+            ProviderCode::Codex,
+            Some("123e4567-e89b-12d3-a456-426614174000".into()),
+            None,
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_codex_resume".into(),
+                message: "continue".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            start.command.args,
+            vec![
+                "exec",
+                "--cd",
+                temp.path()
+                    .join("sandbox")
+                    .join("thread_codex_resume")
+                    .to_str()
+                    .unwrap(),
+                "--sandbox",
+                "danger-full-access",
+                "--skip-git-repo-check",
+                "--json",
+                "resume",
+                "123e4567-e89b-12d3-a456-426614174000",
+                "-"
+            ]
+        );
+        assert!(!start.command.args.iter().any(|arg| arg == "--last"));
+        assert_eq!(start.command.prompt, "continue");
+        assert_eq!(start.command.stdin, "continue");
+        assert_provider_instruction_absent(&start.command);
+    }
+
+    #[test]
+    fn gemini_new_command_writes_prompt_to_stdin_and_does_not_supply_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_gemini_new",
+            ProviderCode::Gemini,
+            None,
+            Some("gemini-2.5-pro".into()),
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_gemini_new".into(),
+                message: "hello".into(),
+            })
+            .unwrap();
+
+        assert_eq!(start.command.program, "gemini");
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--model", "gemini-2.5-pro"]));
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--output-format", "stream-json"]));
+        assert!(!start.command.args.iter().any(|arg| arg == "--prompt"));
+        assert!(!start.command.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!start
+            .command
+            .args
+            .iter()
+            .any(|arg| arg == "User message: hello"));
+        assert_provider_instruction_present(&start.command);
+        assert!(start.command.prompt.ends_with("hello"));
+        assert!(start.command.stdin.ends_with("hello"));
+    }
+
+    #[test]
+    fn gemini_resume_writes_prompt_to_stdin_and_uses_explicit_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_gemini_resume",
+            ProviderCode::Gemini,
+            Some("123e4567-e89b-12d3-a456-426614174000".into()),
+            None,
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_gemini_resume".into(),
+                message: "continue".into(),
+            })
+            .unwrap();
+
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| { args == ["--resume", "123e4567-e89b-12d3-a456-426614174000"] }));
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--output-format", "stream-json"]));
+        assert!(!start.command.args.iter().any(|arg| arg == "latest"));
+        assert!(!start.command.args.iter().any(|arg| arg == "--prompt"));
+        assert!(!start.command.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!start
+            .command
+            .args
+            .iter()
+            .any(|arg| arg == "User message: continue"));
+        assert_eq!(start.command.prompt, "continue");
+        assert_eq!(start.command.stdin, "continue");
+        assert_provider_instruction_absent(&start.command);
+    }
+
+    #[test]
+    fn gemini_run_preserves_multiline_markdown_json_and_quotes_in_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_gemini_special",
+            ProviderCode::Gemini,
+            None,
+            None,
+        );
+        let message =
+            "line 1\n\n```json\n{\"quote\":\"hello \\\"world\\\"\",\"markdown\":\"**bold**\"}\n```";
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_gemini_special".into(),
+                message: message.into(),
+            })
+            .unwrap();
+
+        assert!(start.command.stdin.ends_with(message));
+        assert!(start.command.prompt.ends_with(message));
+        assert_provider_instruction_present(&start.command);
+        assert!(!start.command.args.iter().any(|arg| arg == "--prompt"));
+        assert!(!start.command.args.iter().any(|arg| arg == message));
+    }
+
+    #[test]
+    fn gemini_resume_preserves_multiline_markdown_json_and_quotes_in_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_gemini_resume_special",
+            ProviderCode::Gemini,
+            Some("123e4567-e89b-12d3-a456-426614174000".into()),
+            Some("gemini-2.5-pro".into()),
+        );
+        let message =
+            "line 1\n\n```json\n{\"quote\":\"hello \\\"world\\\"\",\"markdown\":\"**bold**\"}\n```";
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_gemini_resume_special".into(),
+                message: message.into(),
+            })
+            .unwrap();
+
+        assert_eq!(start.command.stdin, message);
+        assert_eq!(start.command.prompt, message);
+        assert_provider_instruction_absent(&start.command);
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--resume", "123e4567-e89b-12d3-a456-426614174000"]));
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--model", "gemini-2.5-pro"]));
+        assert!(!start.command.args.iter().any(|arg| arg == "--prompt"));
+        assert!(!start.command.args.iter().any(|arg| arg == message));
+    }
+
+    #[test]
+    fn opencode_new_command_uses_json_dir_model_and_stdin_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_opencode_new",
+            ProviderCode::OpenCode,
+            None,
+            Some("ollama/qwen2.5-coder:14b".into()),
+        );
+        let message = "line 1\n{\"quote\":\"hello \\\"world\\\"\"}\n中文";
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_opencode_new".into(),
+                message: message.into(),
+            })
+            .unwrap();
+
+        let sandbox_path = temp.path().join("sandbox").join("thread_opencode_new");
+        assert_eq!(start.command.program, "opencode");
+        assert_eq!(
+            start.command.args,
+            vec![
+                "run",
+                "--dangerously-skip-permissions",
+                "--thinking",
+                "--pure",
+                "--format",
+                "json",
+                "--dir",
+                sandbox_path.to_str().unwrap(),
+                "--model",
+                "ollama/qwen2.5-coder:14b",
+                "-"
+            ]
+        );
+        assert_eq!(start.command.cwd, sandbox_path);
+        assert!(start.command.stdin.ends_with(message));
+        assert_provider_instruction_present(&start.command);
+        assert!(!start
+            .command
+            .args
+            .iter()
+            .any(|arg| arg == &start.command.stdin));
+        assert_env(&start.command, "PEDELEC_PROVIDER", "opencode");
+    }
+
+    #[test]
+    fn opencode_resume_uses_explicit_session_id_and_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_opencode_resume",
+            ProviderCode::OpenCode,
+            Some("ses_123".into()),
+            Some("anthropic/claude-sonnet-4".into()),
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_opencode_resume".into(),
+                message: "continue".into(),
+            })
+            .unwrap();
+
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--session", "ses_123"]));
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--model", "anthropic/claude-sonnet-4"]));
+        assert!(!start.command.args.iter().any(|arg| arg == "--last"));
+        assert_eq!(start.command.prompt, "continue");
+        assert_eq!(start.command.stdin, "continue");
+        assert_provider_instruction_absent(&start.command);
+    }
+
+    #[test]
+    fn opencode_parser_updates_session_and_assistant_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_opencode_parse",
+            ProviderCode::OpenCode,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_opencode_parse");
+
+        runtime.emit_provider_stdout(
+            "thread_opencode_parse",
+            r#"{"type":"session.created","id":"ses_123"}"#.to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_opencode_parse",
+            r#"{"type":"assistant.text.delta","delta":"hello"}"#.to_string() + "\n",
+        );
+
+        assert_eq!(
+            runtime
+                .provider_state("thread_opencode_parse")
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("ses_123")
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "hello")
+        ));
+    }
+
+    #[test]
+    fn opencode_invalid_json_emits_structured_error_without_panic() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_opencode_invalid_json",
+            ProviderCode::OpenCode,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_opencode_invalid_json");
+
+        runtime.emit_provider_stdout("thread_opencode_invalid_json", "{not-json}\n".into());
+
+        assert_eq!(
+            runtime.thread_status("thread_opencode_invalid_json"),
+            Some(ThreadStatus::Error)
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::Error { error, .. } if error.code == error_codes::PROVIDER_COMMAND_FAILED)
+        ));
+    }
+
+    #[test]
+    fn cursor_new_command_uses_agent_workspace_model_json_and_stdin_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_cursor_new",
+            ProviderCode::Cursor,
+            None,
+            Some("gpt-5".into()),
+        );
+        let message = "line 1\n{\"quote\":\"hello \\\"world\\\"\"}\n中文";
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_cursor_new".into(),
+                message: message.into(),
+            })
+            .unwrap();
+
+        let sandbox_path = temp.path().join("sandbox").join("thread_cursor_new");
+        assert_eq!(start.command.program, "agent");
+        assert_eq!(
+            start.command.args,
+            vec![
+                "--workspace",
+                sandbox_path.to_str().unwrap(),
+                "--output-format",
+                "stream-json",
+                "--force",
+                "--trust",
+                "--model",
+                "gpt-5",
+            ]
+        );
+        assert_eq!(start.command.cwd, sandbox_path);
+        assert!(start.command.stdin.ends_with(message));
+        assert_provider_instruction_present(&start.command);
+        assert!(!start
+            .command
+            .args
+            .iter()
+            .any(|arg| arg == &start.command.stdin));
+        assert_env(&start.command, "PEDELEC_PROVIDER", "cursor");
+    }
+
+    #[test]
+    fn cursor_resume_uses_explicit_session_id_and_omits_provider_instruction() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_cursor_resume",
+            ProviderCode::Cursor,
+            Some("cur_123".into()),
+            Some("gpt-5".into()),
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_cursor_resume".into(),
+                message: "continue".into(),
+            })
+            .unwrap();
+
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--resume", "cur_123"]));
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--model", "gpt-5"]));
+        assert!(start
+            .command
+            .args
+            .windows(2)
+            .any(|args| args == ["--output-format", "stream-json"]));
+        assert_eq!(start.command.prompt, "continue");
+        assert_eq!(start.command.stdin, "continue");
+        assert_provider_instruction_absent(&start.command);
+    }
+
+    #[test]
+    fn cursor_parser_updates_session_and_assistant_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_cursor_parse",
+            ProviderCode::Cursor,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_cursor_parse");
+
+        runtime.emit_provider_stdout(
+            "thread_cursor_parse",
+            r#"{"type":"assistant","subtype":"delta","text":"hello","session_id":"cur_123"}"#
+                .to_string()
+                + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_cursor_parse",
+            r#"{"message":{"type":"assistant","content":[{"type":"text","text":" world"}]},"conversationId":"cur_123"}"#
+                .to_string()
+                + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_cursor_parse",
+            r#"{"role":"assistant","text":"role only"}"#.to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_cursor_parse",
+            r#"{"type":"text","text":"text only"}"#.to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_cursor_parse",
+            r#"{"subtype":"delta","text":"delta only"}"#.to_string() + "\n",
+        );
+
+        assert_eq!(
+            runtime
+                .provider_state("thread_cursor_parse")
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("cur_123")
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "hello")
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "world")
+        ));
+        assert!(events.iter().all(
+            |event| !matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "role only" || text == "text only" || text == "delta only")
+        ));
+    }
+
+    #[test]
+    fn cursor_invalid_json_emits_structured_error_without_panic() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_cursor_invalid_json",
+            ProviderCode::Cursor,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_cursor_invalid_json");
+
+        runtime.emit_provider_stdout("thread_cursor_invalid_json", "{not-json}\n".into());
+
+        assert_eq!(
+            runtime.thread_status("thread_cursor_invalid_json"),
+            Some(ThreadStatus::Error)
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::Error { error, .. } if error.code == error_codes::PROVIDER_COMMAND_FAILED)
+        ));
+    }
+
+    #[test]
+    fn claude_new_command_uses_stream_json_permissions_model_and_stdin_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_claude_new",
+            ProviderCode::Claude,
+            None,
+            Some("sonnet".into()),
+        );
+        let message = "line 1\n{\"quote\":\"hello \\\"world\\\"\"}\n中文";
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_claude_new".into(),
+                message: message.into(),
+            })
+            .unwrap();
+
+        let sandbox_path = temp.path().join("sandbox").join("thread_claude_new");
+        assert_eq!(start.command.program, "claude");
+        assert_eq!(
+            start.command.args,
+            vec![
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--dangerously-skip-permissions",
+                "--model",
+                "sonnet",
+            ]
+        );
+        assert_eq!(start.command.cwd, sandbox_path);
+        assert!(start.command.stdin.ends_with(message));
+        assert_provider_instruction_present(&start.command);
+        assert!(!start.command.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!start.command.args.iter().any(|arg| arg == "--continue"));
+        assert!(!start.command.args.iter().any(|arg| arg == "--add-dir"));
+        assert_env(&start.command, "PEDELEC_PROVIDER", "claude");
+    }
+
+    #[test]
+    fn claude_resume_uses_explicit_session_id_and_omits_provider_instruction() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_claude_resume",
+            ProviderCode::Claude,
+            Some("4fab02ca-67b9-489d-8b89-0b1f0b9550e6".into()),
+            Some("sonnet".into()),
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_claude_resume".into(),
+                message: "continue".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            start.command.args,
+            vec![
+                "-p",
+                "--resume",
+                "4fab02ca-67b9-489d-8b89-0b1f0b9550e6",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--dangerously-skip-permissions",
+                "--model",
+                "sonnet",
+            ]
+        );
+        assert_eq!(start.command.prompt, "continue");
+        assert_eq!(start.command.stdin, "continue");
+        assert_provider_instruction_absent(&start.command);
+        assert!(!start.command.args.iter().any(|arg| arg == "--continue"));
+        assert!(!start.command.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!start.command.args.iter().any(|arg| arg == "--add-dir"));
+    }
+
+    #[test]
+    fn claude_parser_updates_session_from_init_and_assistant_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_claude_parse",
+            ProviderCode::Claude,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_claude_parse");
+
+        runtime.emit_provider_stdout(
+            "thread_claude_parse",
+            r#"{"type":"system","subtype":"init","cwd":"C:\\Users\\kaoru","session_id":"4fab02ca-67b9-489d-8b89-0b1f0b9550e6","tools":[]}"#
+                .to_string()
+                + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_claude_parse",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#
+                .to_string()
+                + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_claude_parse",
+            r#"{"type":"user","session_id":"do-not-use","message":{"role":"user","content":[{"type":"text","text":"ignore"}]}}"#
+                .to_string()
+                + "\n",
+        );
+
+        assert_eq!(
+            runtime
+                .provider_state("thread_claude_parse")
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("4fab02ca-67b9-489d-8b89-0b1f0b9550e6")
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "hello")
+        ));
+        assert!(events.iter().all(
+            |event| !matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "ignore")
+        ));
+    }
+
+    #[test]
+    fn claude_invalid_json_emits_structured_error_without_panic() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_claude_invalid_json",
+            ProviderCode::Claude,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_claude_invalid_json");
+
+        runtime.emit_provider_stdout("thread_claude_invalid_json", "{not-json}\n".into());
+
+        assert_eq!(
+            runtime.thread_status("thread_claude_invalid_json"),
+            Some(ThreadStatus::Error)
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::Error { error, .. } if error.code == error_codes::PROVIDER_COMMAND_FAILED)
+        ));
+    }
+
+    #[test]
+    fn list_providers_includes_opencode_unavailable_without_panic() {
+        let providers = list_provider_infos(Some(OsString::from("")));
+        let opencode = providers
+            .iter()
+            .find(|provider| provider.code == ProviderCode::OpenCode)
+            .unwrap();
+
+        assert_eq!(opencode.name, "OpenCode");
+        assert!(!opencode.available);
+        assert_eq!(opencode.path, None);
+        assert!(opencode.error.as_deref().unwrap().contains("PATH"));
+    }
+
+    #[test]
+    fn list_providers_includes_cursor_unavailable_without_panic() {
+        let providers = list_provider_infos(Some(OsString::from("")));
+        let cursor = providers
+            .iter()
+            .find(|provider| provider.code == ProviderCode::Cursor)
+            .unwrap();
+
+        assert_eq!(cursor.name, "Cursor");
+        assert!(!cursor.available);
+        assert_eq!(cursor.path, None);
+        assert!(cursor.error.as_deref().unwrap().contains("PATH"));
+    }
+
+    #[test]
+    fn list_providers_includes_claude_unavailable_without_panic() {
+        let providers = list_provider_infos(Some(OsString::from("")));
+        let claude = providers
+            .iter()
+            .find(|provider| provider.code == ProviderCode::Claude)
+            .unwrap();
+
+        assert_eq!(claude.name, "Claude Code");
+        assert!(!claude.available);
+        assert_eq!(claude.path, None);
+        assert!(claude.error.as_deref().unwrap().contains("PATH"));
+    }
+
+    #[test]
+    fn list_providers_uses_expected_order() {
+        let providers = list_provider_infos(Some(OsString::from("")));
+        let codes = providers
+            .into_iter()
+            .map(|provider| provider.code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            codes,
+            vec![
+                ProviderCode::Codex,
+                ProviderCode::Gemini,
+                ProviderCode::OpenCode,
+                ProviderCode::Cursor,
+                ProviderCode::Claude,
+            ]
+        );
+    }
+
+    #[test]
+    fn settings_missing_file_returns_initial_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = CoreRuntime {
+            settings_file_path: Some(temp.path().join("settings.json")),
+            ..CoreRuntime::default()
+        };
+
+        let settings = runtime.get_settings().unwrap();
+
+        assert_eq!(settings, PedelecSettings::default());
+    }
+
+    #[test]
+    fn update_settings_persists_provider_and_trims_empty_model_to_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_path = test_provider_path(temp.path(), "codex");
+        let settings_path = temp.path().join("settings.json");
+        let mut runtime = CoreRuntime {
+            settings_file_path: Some(settings_path.clone()),
+            provider_path_value_override: Some(provider_path),
+            ..CoreRuntime::default()
+        };
+
+        let saved = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Codex,
+                default_model: Some("   ".into()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            saved,
+            PedelecSettings {
+                default_provider: Some(ProviderCode::Codex),
+                default_model: None,
+            }
+        );
+        assert_eq!(read_settings_file(&settings_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn update_settings_rejects_unavailable_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = CoreRuntime {
+            settings_file_path: Some(temp.path().join("settings.json")),
+            provider_path_value_override: Some(OsString::from("")),
+            ..CoreRuntime::default()
+        };
+
+        let err = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Codex,
+                default_model: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.code, error_codes::DEFAULT_PROVIDER_UNAVAILABLE);
+        assert!(!temp.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn provider_binary_lookup_candidates_include_windows_opencode_names() {
+        let dirs = vec![PathBuf::from("C:/bin")];
+        let candidates = provider_binary_lookup_candidates("opencode", &dirs);
+
+        #[cfg(windows)]
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("C:/bin/opencode"),
+                PathBuf::from("C:/bin/opencode.exe"),
+                PathBuf::from("C:/bin/opencode.cmd"),
+                PathBuf::from("C:/bin/opencode.bat"),
+            ]
+        );
+
+        #[cfg(not(windows))]
+        assert_eq!(candidates, vec![PathBuf::from("C:/bin").join("opencode")]);
+    }
+
+    #[test]
+    fn provider_binary_lookup_candidates_include_windows_cursor_agent_names() {
+        let dirs = vec![PathBuf::from("C:/bin")];
+        let candidates = provider_binary_lookup_candidates("agent", &dirs);
+
+        #[cfg(windows)]
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("C:/bin/agent"),
+                PathBuf::from("C:/bin/agent.exe"),
+                PathBuf::from("C:/bin/agent.cmd"),
+                PathBuf::from("C:/bin/agent.bat"),
+            ]
+        );
+
+        #[cfg(not(windows))]
+        assert_eq!(candidates, vec![PathBuf::from("C:/bin").join("agent")]);
+    }
+
+    #[test]
+    fn provider_parser_buffers_jsonl_and_updates_session_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_parse",
+            ProviderCode::Codex,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_parse");
+
+        runtime.emit_provider_stdout("thread_parse", r#"{"sessionId":"123e4567-e89b"#.into());
+        runtime.emit_provider_stdout(
+            "thread_parse",
+            r#"-12d3-a456-426614174000","text":"hello"}"#.to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_parse",
+            r#"{"sessionId":"123e4567-e89b-12d3-a456-426614174000"}"#.to_string() + "\n",
+        );
+
+        assert_eq!(
+            runtime
+                .provider_state("thread_parse")
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ThreadEvent::ProviderSessionIdUpdated { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(events[0], ThreadEvent::RawStdout { .. }));
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "hello")
+        ));
+    }
+
+    #[test]
+    fn codex_assistant_message_parser_does_not_require_role() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_codex_text",
+            ProviderCode::Codex,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_codex_text");
+
+        runtime.emit_provider_stdout(
+            "thread_codex_text",
+            r#"{"text":"hello"}"#.to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_codex_text",
+            r#"{"role":"user","text":"still codex"}"#.to_string() + "\n",
+        );
+
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "hello")
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "still codex")
+        ));
+    }
+
+    #[test]
+    fn gemini_assistant_message_parser_requires_assistant_role_in_same_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_gemini_role",
+            ProviderCode::Gemini,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_gemini_role");
+
+        runtime.emit_provider_stdout(
+            "thread_gemini_role",
+            r#"{"role":"assistant","text":"hello"}"#.to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_gemini_role",
+            r#"{"role":"user","text":"ignore user"}"#.to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_gemini_role",
+            r#"{"text":"ignore missing role"}"#.to_string() + "\n",
+        );
+
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "hello")
+        ));
+        assert!(events.iter().all(|event| {
+            !matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "ignore user" || text == "ignore missing role")
+        }));
+    }
+
+    #[test]
+    fn gemini_assistant_message_parser_matches_nested_same_object_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_gemini_nested_role",
+            ProviderCode::Gemini,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_gemini_nested_role");
+
+        runtime.emit_provider_stdout(
+            "thread_gemini_nested_role",
+            r#"{"candidates":[{"content":{"role":"assistant","parts":[{"text":"nested hello"}]}}]}"#
+                .to_string() + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_gemini_nested_role",
+            r#"{"items":[{"role":"assistant"},{"text":"sibling text"}]}"#.to_string() + "\n",
+        );
+
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "nested hello")
+        ));
+        assert!(events.iter().all(|event| {
+            !matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "sibling text")
+        }));
+    }
+
+    #[test]
+    fn codex_thread_started_updates_session_id_once_and_resume_uses_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_codex_started",
+            ProviderCode::Codex,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_codex_started");
+
+        runtime.emit_provider_stdout(
+            "thread_codex_started",
+            r#"{"type":"thread.started","thread_id":"019e91d7-4a21-7ca0-aeef-c27ce6e334c5"}"#
+                .to_string()
+                + "\n",
+        );
+        runtime.emit_provider_stdout(
+            "thread_codex_started",
+            r#"{"type":"thread.started","thread_id":"019e91d7-4a21-7ca0-aeef-c27ce6e334c5"}"#
+                .to_string()
+                + "\n",
+        );
+
+        assert_eq!(
+            runtime
+                .provider_state("thread_codex_started")
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("019e91d7-4a21-7ca0-aeef-c27ce6e334c5")
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ThreadEvent::ProviderSessionIdUpdated { .. }))
+                .count(),
+            1
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_codex_started".into(),
+                message: "continue".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            start.command.args,
+            vec![
+                "exec",
+                "--cd",
+                temp.path()
+                    .join("sandbox")
+                    .join("thread_codex_started")
+                    .to_str()
+                    .unwrap(),
+                "--sandbox",
+                "danger-full-access",
+                "--skip-git-repo-check",
+                "--json",
+                "resume",
+                "019e91d7-4a21-7ca0-aeef-c27ce6e334c5",
+                "-"
+            ]
+        );
+    }
+
+    #[test]
+    fn unrelated_json_thread_id_does_not_update_provider_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_unrelated_id",
+            ProviderCode::Codex,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_unrelated_id");
+
+        runtime.emit_provider_stdout(
+            "thread_unrelated_id",
+            r#"{"type":"turn.started","thread_id":"019e91d7-4a21-7ca0-aeef-c27ce6e334c5"}"#
+                .to_string()
+                + "\n",
+        );
+
+        assert_eq!(
+            runtime
+                .provider_state("thread_unrelated_id")
+                .unwrap()
+                .provider_session_id,
+            None
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ThreadEvent::ProviderSessionIdUpdated { .. })));
+    }
+
+    #[test]
+    fn malformed_provider_json_still_emits_raw_and_keeps_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_malformed",
+            ProviderCode::Codex,
+            None,
+            None,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_malformed");
+
+        runtime.emit_provider_stdout("thread_malformed", "{not-json}\n".into());
+
+        assert_eq!(
+            runtime.thread_status("thread_malformed"),
+            Some(ThreadStatus::Idle)
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ThreadEvent::RawStdout { .. }));
+    }
+
+    #[test]
+    fn thread_state_serializes_camel_case_fields() {
+        let now = DateTime::parse_from_rfc3339("2026-06-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let state = ThreadState {
+            thread_id: "thread_abc123".into(),
+            provider: ProviderCode::Codex,
+            model: Some("gpt-5".into()),
+            sandbox_path: PathBuf::from("C:/tmp/pedelec/thread_abc123"),
+            skills: vec![SkillFile {
+                original_url: "https://example.test/tools.md".into(),
+                original_filename: "tools.md".into(),
+                local_path: PathBuf::from("skills/tools.md"),
+                sha256: "abc".into(),
+                size_bytes: 12,
+            }],
+            status: ThreadStatus::Idle,
+            process_id: Some(42),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let value = serde_json::to_value(state).unwrap();
+        assert!(value.get("threadId").is_some());
+        assert!(value.get("sandboxPath").is_some());
+        assert!(value.get("createdAt").is_some());
+        assert!(value.get("thread_id").is_none());
+        assert!(value.get("sandbox_path").is_none());
+        assert!(value.get("created_at").is_none());
+    }
+
+    #[test]
+    fn provider_instruction_omits_tools_md_when_missing() {
+        let now = chrono::Utc::now();
+        let thread = ThreadState {
+            thread_id: "thread_no_tools_md".into(),
+            provider: ProviderCode::Codex,
+            model: None,
+            sandbox_path: PathBuf::from("sandbox").join("thread_no_tools_md"),
+            skills: vec![SkillFile {
+                original_url: "https://example.test/tools.json".into(),
+                original_filename: "tools.json".into(),
+                local_path: PathBuf::from("skills").join("tools.json"),
+                sha256: "sha".into(),
+                size_bytes: 2,
+            }],
+            status: ThreadStatus::Idle,
+            process_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let instruction = build_provider_instruction(&thread);
+
+        assert!(!instruction.contains("skills/tools.md"));
+        assert!(!instruction.contains("pedelec-cli tool-call"));
+        assert_eq!(instruction, "");
+    }
+
+    #[test]
+    fn thread_event_serializes_snake_case_tags_and_camel_case_fields() {
+        let status_event = ThreadEvent::StatusChanged {
+            seq: 1,
+            thread_id: "thread_abc123".into(),
+            status: ThreadStatus::WaitingToolResult,
+        };
+        let status_value = serde_json::to_value(status_event).unwrap();
+        assert_eq!(status_value["type"], json!("status_changed"));
+        assert_eq!(status_value["threadId"], json!("thread_abc123"));
+        assert!(status_value.get("thread_id").is_none());
+
+        let stdout_event = ThreadEvent::RawStdout {
+            seq: 2,
+            thread_id: "thread_abc123".into(),
+            text: "hello".into(),
+        };
+        let stdout_value = serde_json::to_value(stdout_event).unwrap();
+        assert_eq!(stdout_value["type"], json!("raw_stdout"));
+        assert_eq!(stdout_value["threadId"], json!("thread_abc123"));
+
+        let session_event = ThreadEvent::ProviderSessionIdUpdated {
+            seq: 3,
+            thread_id: "thread_abc123".into(),
+            provider_session_id: "session_xyz".into(),
+        };
+        let session_value = serde_json::to_value(session_event).unwrap();
+        assert_eq!(session_value["type"], json!("provider_session_id_updated"));
+        assert_eq!(session_value["providerSessionId"], json!("session_xyz"));
+        assert!(session_value.get("provider_session_id").is_none());
+
+        let command_event = ThreadEvent::ProviderCommandStarted {
+            seq: 4,
+            thread_id: "thread_abc123".into(),
+            process_id: 42,
+            program: "codex".into(),
+            args: vec!["exec".into(), "-".into()],
+            cwd: "C:/tmp/pedelec/thread_abc123".into(),
+            prompt: "full provider prompt".into(),
+        };
+        let command_value = serde_json::to_value(command_event).unwrap();
+        assert_eq!(command_value["type"], json!("provider_command_started"));
+        assert_eq!(command_value["threadId"], json!("thread_abc123"));
+        assert_eq!(command_value["processId"], json!(42));
+        assert_eq!(command_value["program"], json!("codex"));
+        assert_eq!(command_value["args"], json!(["exec", "-"]));
+        assert_eq!(command_value["cwd"], json!("C:/tmp/pedelec/thread_abc123"));
+        assert_eq!(command_value["prompt"], json!("full provider prompt"));
+        assert!(command_value.get("thread_id").is_none());
+        assert!(command_value.get("process_id").is_none());
+        assert!(command_value.get("stdin").is_none());
+        assert!(command_value.get("env").is_none());
+    }
+
+    #[test]
+    fn all_thread_subscription_receives_later_events_without_crossing_thread_subscription() {
+        let mut event_bus = EventBus::default();
+        let all_rx = event_bus.subscribe_all();
+        let thread_one_rx = event_bus.subscribe("thread_one");
+
+        event_bus.emit_created("thread_one");
+        event_bus.emit_created("thread_two");
+
+        let first_all = all_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second_all = all_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            first_all,
+            ThreadEvent::Created {
+                thread_id,
+                ..
+            } if thread_id == "thread_one"
+        ));
+        assert!(matches!(
+            second_all,
+            ThreadEvent::Created {
+                thread_id,
+                ..
+            } if thread_id == "thread_two"
+        ));
+
+        let thread_one_event = thread_one_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            thread_one_event,
+            ThreadEvent::Created {
+                thread_id,
+                ..
+            } if thread_id == "thread_one"
+        ));
+        assert!(thread_one_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+    }
+
+    #[test]
+    fn pedelec_error_omits_empty_details() {
+        let error = PedelecError::new(
+            error_codes::CORE_RUNTIME_UNAVAILABLE,
+            "pedelec-app is not running",
+        );
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["code"], json!("CORE_RUNTIME_UNAVAILABLE"));
+        assert_eq!(value["message"], json!("pedelec-app is not running"));
+        assert!(value.get("details").is_none());
+    }
+
+    #[test]
+    fn sandbox_creates_required_subdirectories_and_removes_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::with_sandbox_root(temp.path().join("sandbox"));
+
+        let sandbox = manager.create_thread_sandbox("thread_abc123").unwrap();
+
+        assert!(sandbox.exists());
+        for subdir in SANDBOX_SUBDIRS {
+            assert!(sandbox.join(subdir).is_dir(), "missing subdir {subdir}");
+        }
+
+        manager.remove_thread_sandbox(&sandbox).unwrap();
+        assert!(!sandbox.exists());
+    }
+
+    #[test]
+    fn sandbox_rollback_removes_partial_sandbox_after_skill_download_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SandboxManager::with_sandbox_root(temp.path().join("sandbox"));
+        let skill_manager = SkillManager::default();
+        let bad_urls = vec!["http://example.com/tools.md".to_string()];
+
+        let result = manager.create_thread_sandbox_with("thread_rollback", |sandbox| {
+            skill_manager.download_skills(sandbox.join("skills"), &bad_urls)
+        });
+
+        assert_eq!(result.unwrap_err().code, error_codes::SKILL_URL_INVALID);
+        assert!(!temp.path().join("sandbox").join("thread_rollback").exists());
+    }
+
+    #[test]
+    fn skill_url_validation_accepts_https_and_loopback_http() {
+        for url in [
+            "https://example.com/tools.md",
+            "http://localhost/tools.md",
+            "http://127.0.0.1/tools.md",
+            "http://[::1]/tools.md",
+        ] {
+            assert!(validate_skill_url_and_filename(url).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn skill_url_validation_rejects_disallowed_sources_and_traversal() {
+        for url in [
+            "http://example.com/tools.md",
+            "file:///tmp/tools.md",
+            "tools.md",
+            "https://example.com/../tools.md",
+            "https://example.com/%2e%2e/tools.md",
+        ] {
+            assert_eq!(
+                validate_skill_url_and_filename(url).unwrap_err().code,
+                error_codes::SKILL_URL_INVALID,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_download_adds_duplicate_suffix_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join("skills");
+        let (base_url, handle) = start_test_http_server(vec![
+            ("/a/tools.md", b"first".to_vec()),
+            ("/b/tools.md", b"second".to_vec()),
+        ]);
+        let urls = vec![
+            format!("{base_url}/a/tools.md"),
+            format!("{base_url}/b/tools.md"),
+        ];
+
+        let skills = SkillManager::default()
+            .download_skills(&skills_dir, &urls)
+            .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].original_filename, "tools.md");
+        assert_eq!(skills[1].original_filename, "tools.md");
+        assert_eq!(skills[0].local_path.file_name().unwrap(), "tools.md");
+        assert_eq!(skills[1].local_path.file_name().unwrap(), "tools_1.md");
+        assert_eq!(skills[0].size_bytes, 5);
+        assert_eq!(skills[1].size_bytes, 6);
+        assert_eq!(
+            skills[0].sha256,
+            "a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e"
+        );
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("tools.md")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("tools_1.md")).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn missing_tools_json_returns_empty_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::load_from_skills_dir(temp.path()).unwrap();
+
+        assert_eq!(
+            registry
+                .validate_tool_call("missing", &json!({}))
+                .unwrap_err()
+                .code,
+            error_codes::TOOL_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn invalid_tools_json_returns_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("tools.json"), "{").unwrap();
+
+        let err = ToolRegistry::load_from_skills_dir(temp.path()).unwrap_err();
+
+        assert_eq!(err.code, error_codes::TOOLS_JSON_INVALID);
+    }
+
+    #[test]
+    fn tool_registry_validates_tool_calls_and_schema() {
+        let registry = ToolRegistry::from_tools_json_str(
+            r#"{
+                "tools": [
+                    {
+                        "name": "update_counter",
+                        "description": "Update counter.",
+                        "argsSchema": {
+                            "type": "object",
+                            "properties": {
+                                "delta": { "type": "integer" }
+                            },
+                            "required": ["delta"],
+                            "additionalProperties": false
+                        },
+                        "timeoutMs": 1234
+                    },
+                    {
+                        "name": "get_app_state",
+                        "description": "Read state.",
+                        "argsSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry
+                .validate_tool_call("update_counter", &json!({ "delta": 1 }))
+                .unwrap(),
+            1234
+        );
+        assert_eq!(
+            registry
+                .validate_tool_call("get_app_state", &json!({}))
+                .unwrap(),
+            DEFAULT_TOOL_TIMEOUT_MS
+        );
+        assert_eq!(
+            registry
+                .validate_tool_call("missing", &json!({}))
+                .unwrap_err()
+                .code,
+            error_codes::TOOL_NOT_FOUND
+        );
+        assert_eq!(
+            registry
+                .validate_tool_call("update_counter", &json!(null))
+                .unwrap_err()
+                .code,
+            error_codes::TOOL_ARGS_INVALID
+        );
+        assert_eq!(
+            registry
+                .validate_tool_call("update_counter", &json!({ "delta": "1" }))
+                .unwrap_err()
+                .code,
+            error_codes::TOOL_ARGS_INVALID
+        );
+    }
+
+    #[test]
+    fn tool_call_timeout_override_strips_control_arg_when_schema_omits_it() {
+        let registry = ToolRegistry::from_tools_json_str(
+            r#"{
+                "tools": [{
+                    "name": "get_app_state",
+                    "description": "Read state.",
+                    "argsSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    },
+                    "timeoutMs": 5000
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let normalized = registry
+            .normalize_tool_call("get_app_state", &json!({ "timeoutMs": 25 }))
+            .unwrap();
+
+        assert_eq!(normalized.timeout_ms, 25);
+        assert_eq!(normalized.args, json!({}));
+    }
+
+    #[test]
+    fn tool_call_timeout_override_preserves_arg_when_schema_defines_it() {
+        let registry = ToolRegistry::from_tools_json_str(
+            r#"{
+                "tools": [{
+                    "name": "wait_for_counter",
+                    "description": "Wait for state.",
+                    "argsSchema": {
+                        "type": "object",
+                        "properties": {
+                            "timeoutMs": { "type": "integer" }
+                        },
+                        "required": ["timeoutMs"],
+                        "additionalProperties": false
+                    },
+                    "timeoutMs": 5000
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let normalized = registry
+            .normalize_tool_call("wait_for_counter", &json!({ "timeoutMs": 25 }))
+            .unwrap();
+
+        assert_eq!(normalized.timeout_ms, 25);
+        assert_eq!(normalized.args, json!({ "timeoutMs": 25 }));
+    }
+
+    #[test]
+    fn tool_call_timeout_override_must_be_positive_integer() {
+        let registry = ToolRegistry::from_tools_json_str(
+            r#"{
+                "tools": [{
+                    "name": "get_app_state",
+                    "description": "Read state.",
+                    "argsSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        for invalid_timeout in [json!(0), json!(-1), json!(1.5), json!("100")] {
+            let err = registry
+                .normalize_tool_call("get_app_state", &json!({ "timeoutMs": invalid_timeout }))
+                .unwrap_err();
+            assert_eq!(err.code, error_codes::TOOL_ARGS_INVALID);
+        }
+    }
+
+    #[test]
+    fn begin_tool_call_uses_normalized_args_for_pending_request_and_event() {
+        let mut runtime = runtime_with_tool_thread(
+            "thread_normalized",
+            ThreadStatus::Running,
+            r#"{
+                "tools": [{
+                    "name": "get_app_state",
+                    "description": "Read state.",
+                    "argsSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    },
+                    "timeoutMs": 5000
+                }]
+            }"#,
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_normalized");
+
+        let (request_id, timeout_ms, _result_rx) = runtime
+            .begin_tool_call(ToolCallInput {
+                thread_id: "thread_normalized".into(),
+                tool_name: "get_app_state".into(),
+                args: json!({ "timeoutMs": 25 }),
+            })
+            .unwrap();
+
+        assert_eq!(timeout_ms, 25);
+        assert_eq!(
+            runtime
+                .tool_request_broker
+                .get(&request_id)
+                .unwrap()
+                .request
+                .args,
+            json!({})
+        );
+        let status_event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            status_event,
+            ThreadEvent::StatusChanged {
+                status: ThreadStatus::WaitingToolResult,
+                ..
+            }
+        ));
+        let tool_event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            tool_event,
+            ThreadEvent::ToolCall { args, .. } if args == json!({})
+        ));
+    }
+
+    #[test]
+    fn submit_tool_result_with_wrong_thread_does_not_remove_pending_request() {
+        let mut runtime = runtime_with_tool_thread(
+            "thread_submit",
+            ThreadStatus::Running,
+            r#"{
+                "tools": [{
+                    "name": "get_app_state",
+                    "description": "Read state.",
+                    "argsSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }]
+            }"#,
+        );
+        let (request_id, _timeout_ms, result_rx) = runtime
+            .begin_tool_call(ToolCallInput {
+                thread_id: "thread_submit".into(),
+                tool_name: "get_app_state".into(),
+                args: json!({}),
+            })
+            .unwrap();
+
+        let err = runtime
+            .submit_tool_result(SubmitToolResultInput {
+                thread_id: "wrong_thread".into(),
+                request_id: request_id.clone(),
+                result: json!({ "value": 1 }),
+            })
+            .unwrap_err();
+        assert_eq!(err.code, error_codes::PENDING_TOOL_REQUEST_NOT_FOUND);
+        assert!(runtime.tool_request_broker.get(&request_id).is_some());
+
+        runtime
+            .submit_tool_result(SubmitToolResultInput {
+                thread_id: "thread_submit".into(),
+                request_id,
+                result: json!({ "value": 2 }),
+            })
+            .unwrap();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            json!({ "value": 2 })
+        );
+    }
+
+    #[test]
+    fn tool_registry_store_saves_by_thread_id() {
+        let registry = ToolRegistry::from_tools_json_str(
+            r#"{
+                "tools": [{
+                    "name": "get_app_state",
+                    "description": "Read state.",
+                    "argsSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let mut store = ToolRegistryStore::default();
+
+        store.insert("thread_abc123", registry);
+
+        assert!(store.get("thread_abc123").is_some());
+        assert!(store.remove("thread_abc123").is_some());
+        assert!(store.get("thread_abc123").is_none());
+    }
+
+    #[test]
+    fn create_thread_generates_short_incrementing_thread_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+        let input = CreateThreadInput {
+            provider: ProviderCode::Codex,
+            model: None,
+            skills_urls: vec![],
+        };
+
+        let first = runtime.create_thread(input.clone()).unwrap();
+        let second = runtime.create_thread(input).unwrap();
+
+        assert_eq!(first.thread_id, "t000001");
+        assert_eq!(second.thread_id, "t000002");
+        assert_short_thread_id(&first.thread_id);
+        assert_short_thread_id(&second.thread_id);
+        assert!(sandbox_root.join("t000001").exists());
+        assert!(sandbox_root.join("t000002").exists());
+    }
+
+    #[test]
+    fn create_thread_skips_existing_short_thread_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        fs::create_dir_all(sandbox_root.join("t000001")).unwrap();
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+
+        let output = runtime
+            .create_thread(CreateThreadInput {
+                provider: ProviderCode::Codex,
+                model: None,
+                skills_urls: vec![],
+            })
+            .unwrap();
+
+        assert_eq!(output.thread_id, "t000002");
+        assert_short_thread_id(&output.thread_id);
+        assert!(sandbox_root.join("t000002").exists());
+    }
+
+    #[test]
+    fn create_thread_skips_existing_active_short_thread_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+        let now = chrono::Utc::now();
+        runtime.thread_manager.insert_thread(
+            ThreadState {
+                thread_id: "t000001".into(),
+                provider: ProviderCode::Codex,
+                model: None,
+                sandbox_path: sandbox_root.join("t000001"),
+                skills: vec![],
+                status: ThreadStatus::Idle,
+                process_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            ProviderAdapterState {
+                provider_session_id: None,
+                last_process_id: None,
+            },
+        );
+
+        let output = runtime
+            .create_thread(CreateThreadInput {
+                provider: ProviderCode::Codex,
+                model: None,
+                skills_urls: vec![],
+            })
+            .unwrap();
+
+        assert_eq!(output.thread_id, "t000002");
+        assert_short_thread_id(&output.thread_id);
+        assert!(sandbox_root.join("t000002").exists());
+    }
+
+    #[test]
+    fn cleanup_for_app_exit_ends_active_threads_and_removes_sandboxes() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+        let input = CreateThreadInput {
+            provider: ProviderCode::Codex,
+            model: None,
+            skills_urls: vec![],
+        };
+        let first = runtime.create_thread(input.clone()).unwrap();
+        let second = runtime.create_thread(input).unwrap();
+        runtime
+            .tool_request_broker
+            .create_pending(first.thread_id.clone(), "echo".into(), json!({}), 1000)
+            .unwrap();
+
+        let errors = runtime.cleanup_for_app_exit();
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            runtime.thread_status(&first.thread_id),
+            Some(ThreadStatus::Ended)
+        );
+        assert_eq!(
+            runtime.thread_status(&second.thread_id),
+            Some(ThreadStatus::Ended)
+        );
+        assert!(!runtime
+            .tool_request_broker
+            .has_pending_for_thread(&first.thread_id));
+        assert!(runtime.tool_registry.get(&first.thread_id).is_none());
+        assert!(runtime.tool_registry.get(&second.thread_id).is_none());
+        assert!(!sandbox_root.join(&first.thread_id).exists());
+        assert!(!sandbox_root.join(&second.thread_id).exists());
+    }
+
+    #[test]
+    fn cleanup_for_app_exit_removes_orphan_sandbox_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        fs::create_dir_all(sandbox_root.join("t000999").join("logs")).unwrap();
+        fs::write(sandbox_root.join("keep.txt"), "not a sandbox").unwrap();
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+
+        let errors = runtime.cleanup_for_app_exit();
+
+        assert!(errors.is_empty());
+        assert!(!sandbox_root.join("t000999").exists());
+        assert!(sandbox_root.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn remove_all_thread_sandboxes_succeeds_when_root_does_not_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("missing-sandbox");
+        let manager = SandboxManager::with_sandbox_root(&sandbox_root);
+
+        let errors = manager.remove_all_thread_sandboxes();
+
+        assert!(errors.is_empty());
+        assert!(!sandbox_root.exists());
+    }
+
+    #[test]
+    fn next_thread_id_errors_when_short_id_space_is_exhausted() {
+        let mut manager = ThreadManager {
+            next_thread_number: THREAD_ID_MAX_COUNTER,
+            ..ThreadManager::default()
+        };
+
+        let err = manager.next_thread_id().unwrap_err();
+
+        assert_eq!(err.code, error_codes::SANDBOX_CREATE_FAILED);
+    }
+
+    #[test]
+    fn create_thread_injects_builtin_pedelec_tool_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+
+        let output = runtime
+            .create_thread(CreateThreadInput {
+                provider: ProviderCode::Codex,
+                model: None,
+                skills_urls: vec![],
+            })
+            .unwrap();
+
+        let thread = runtime.thread_manager.thread(&output.thread_id).unwrap();
+        let skill_path = thread
+            .sandbox_path
+            .join("skills")
+            .join(BUILTIN_PEDELEC_TOOL_FILENAME);
+        let content = fs::read_to_string(&skill_path).unwrap();
+        assert!(skill_path.exists());
+        assert!(!content.contains("<thread_id>"));
+        assert!(content.contains(&format!("tool-call {}", output.thread_id)));
+
+        let skill = thread
+            .skills
+            .iter()
+            .find(|skill| {
+                skill.local_path.file_name().and_then(|name| name.to_str())
+                    == Some(BUILTIN_PEDELEC_TOOL_FILENAME)
+            })
+            .unwrap();
+        assert_eq!(skill.original_url, BUILTIN_PEDELEC_TOOL_ORIGINAL_URL);
+        assert_eq!(skill.original_filename, BUILTIN_PEDELEC_TOOL_FILENAME);
+        assert_eq!(skill.local_path, skill_path.canonicalize().unwrap());
+        assert_eq!(skill.size_bytes, content.len() as u64);
+    }
+
+    #[test]
+    fn create_thread_keeps_builtin_pedelec_tool_name_when_download_collides() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let (base_url, handle) =
+            start_test_http_server(vec![("/pedelec-cli.md", b"# downloaded\n".to_vec())]);
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+
+        let output = runtime
+            .create_thread(CreateThreadInput {
+                provider: ProviderCode::Codex,
+                model: None,
+                skills_urls: vec![format!("{base_url}/pedelec-cli.md")],
+            })
+            .unwrap();
+        handle.join().unwrap();
+
+        let thread = runtime.thread_manager.thread(&output.thread_id).unwrap();
+        let skills_dir = thread.sandbox_path.join("skills");
+        let builtin_content =
+            fs::read_to_string(skills_dir.join(BUILTIN_PEDELEC_TOOL_FILENAME)).unwrap();
+        let downloaded_content = fs::read_to_string(skills_dir.join("pedelec-cli_1.md")).unwrap();
+
+        assert!(builtin_content.contains(&format!("tool-call {}", output.thread_id)));
+        assert_eq!(downloaded_content, "# downloaded\n");
+        assert!(thread.skills.iter().any(|skill| {
+            skill.original_url == BUILTIN_PEDELEC_TOOL_ORIGINAL_URL
+                && skill.local_path.file_name().and_then(|name| name.to_str())
+                    == Some(BUILTIN_PEDELEC_TOOL_FILENAME)
+        }));
+        assert!(thread.skills.iter().any(|skill| {
+            skill.original_url == format!("{base_url}/pedelec-cli.md")
+                && skill.local_path.file_name().and_then(|name| name.to_str())
+                    == Some("pedelec-cli_1.md")
+        }));
+    }
+
+    #[test]
+    fn create_thread_registers_idle_state_without_starting_process_and_logs_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let (base_url, handle) = start_test_http_server(vec![
+            (
+                "/tools.json",
+                br#"{
+                    "tools": [{
+                        "name": "get_app_state",
+                        "description": "Read state.",
+                        "argsSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    }]
+                }"#
+                .to_vec(),
+            ),
+            ("/tools.md", b"# Tools\n".to_vec()),
+        ]);
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+
+        let output = runtime
+            .create_thread(CreateThreadInput {
+                provider: ProviderCode::Codex,
+                model: None,
+                skills_urls: vec![
+                    format!("{base_url}/tools.json"),
+                    format!("{base_url}/tools.md"),
+                ],
+            })
+            .unwrap();
+        handle.join().unwrap();
+
+        let thread = runtime.thread_manager.thread(&output.thread_id).unwrap();
+        assert_eq!(thread.status, ThreadStatus::Idle);
+        assert_eq!(thread.process_id, None);
+        assert_eq!(runtime.running_process_count(), 0);
+
+        let log_path = runtime.event_log_path(&output.thread_id).unwrap();
+        let log = fs::read_to_string(log_path).unwrap();
+        let records = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["seq"], json!(1));
+        assert_eq!(records[0]["event"]["type"], json!("created"));
+        assert_eq!(records[1]["seq"], json!(2));
+        assert_eq!(records[1]["event"]["type"], json!("status_changed"));
+        assert_eq!(records[1]["event"]["status"], json!("idle"));
+    }
+
+    #[test]
+    fn create_thread_allows_missing_tools_md() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let (base_url, handle) = start_test_http_server(vec![(
+            "/tools.json",
+            br#"{
+                "tools": [{
+                    "name": "get_app_state",
+                    "description": "Read state.",
+                    "argsSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }]
+            }"#
+            .to_vec(),
+        )]);
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(&sandbox_root),
+            ..CoreRuntime::default()
+        };
+
+        let output = runtime
+            .create_thread(CreateThreadInput {
+                provider: ProviderCode::Codex,
+                model: None,
+                skills_urls: vec![format!("{base_url}/tools.json")],
+            })
+            .unwrap();
+        handle.join().unwrap();
+
+        let thread = runtime.thread_manager.thread(&output.thread_id).unwrap();
+        assert_eq!(thread.status, ThreadStatus::Idle);
+        assert_eq!(thread.process_id, None);
+        assert_eq!(runtime.running_process_count(), 0);
+        assert!(!thread.sandbox_path.join("skills").join("tools.md").exists());
+    }
+
+    fn assert_short_thread_id(thread_id: &str) {
+        assert!(thread_id.len() <= 8);
+        assert!(thread_id.starts_with('t'));
+        let suffix = &thread_id[1..];
+        assert!(suffix.len() >= THREAD_ID_BASE36_MIN_WIDTH);
+        assert!(suffix.len() <= THREAD_ID_BASE36_MAX_WIDTH);
+        assert!(suffix
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch.is_ascii_lowercase()));
+    }
+
+    fn test_provider_path(root: &Path, program: &str) -> OsString {
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        #[cfg(windows)]
+        let program_name = format!("{program}.exe");
+        #[cfg(not(windows))]
+        let program_name = program.to_string();
+        fs::write(bin_dir.join(program_name), b"fake provider").unwrap();
+        env::join_paths([bin_dir]).unwrap()
+    }
+
+    fn start_test_http_server(
+        routes: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_requests = routes.len();
+        let routes: HashMap<String, Vec<u8>> = routes
+            .into_iter()
+            .map(|(path, body)| (path.to_string(), body))
+            .collect();
+
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0; 2048];
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                if let Some(body) = routes.get(path) {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(body).unwrap();
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                }
+            }
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn runtime_with_tool_thread(
+        thread_id: &str,
+        status: ThreadStatus,
+        tools_json: &str,
+    ) -> CoreRuntime {
+        let mut runtime = CoreRuntime::default();
+        let now = chrono::Utc::now();
+        runtime.thread_manager.insert_thread(
+            ThreadState {
+                thread_id: thread_id.into(),
+                provider: ProviderCode::Codex,
+                model: None,
+                sandbox_path: PathBuf::from("sandbox").join(thread_id),
+                skills: vec![],
+                status,
+                process_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            ProviderAdapterState {
+                provider_session_id: None,
+                last_process_id: None,
+            },
+        );
+        runtime.tool_registry.insert(
+            thread_id,
+            ToolRegistry::from_tools_json_str(tools_json).unwrap(),
+        );
+        runtime
+    }
+
+    fn runtime_with_provider_thread(
+        temp: &Path,
+        thread_id: &str,
+        provider: ProviderCode,
+        provider_session_id: Option<String>,
+        model: Option<String>,
+    ) -> CoreRuntime {
+        let mut runtime = CoreRuntime {
+            sandbox_manager: SandboxManager::with_sandbox_root(temp.join("sandbox")),
+            ..CoreRuntime::default()
+        };
+        runtime.set_core_ipc_runtime("127.0.0.1:12345", temp.join("runtime.json"));
+        let sandbox_path = temp.join("sandbox").join(thread_id);
+        fs::create_dir_all(sandbox_path.join("logs")).unwrap();
+        let now = chrono::Utc::now();
+        runtime.thread_manager.insert_thread(
+            ThreadState {
+                thread_id: thread_id.into(),
+                provider,
+                model,
+                sandbox_path,
+                skills: vec![SkillFile {
+                    original_url: "https://example.test/tools.md".into(),
+                    original_filename: "tools.md".into(),
+                    local_path: PathBuf::from("skills").join("tools.md"),
+                    sha256: "sha".into(),
+                    size_bytes: 7,
+                }],
+                status: ThreadStatus::Idle,
+                process_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            ProviderAdapterState {
+                provider_session_id,
+                last_process_id: None,
+            },
+        );
+        runtime
+    }
+
+    fn env_value<'a>(command: &'a CommandSpec, key: &str) -> Option<&'a str> {
+        command
+            .env
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn assert_env(command: &CommandSpec, key: &str, expected: &str) {
+        assert_eq!(env_value(command, key), Some(expected), "env {key}");
+    }
+
+    fn assert_provider_instruction_present(command: &CommandSpec) {
+        for value in [&command.prompt, &command.stdin] {
+            assert!(value.contains("[Hard Rules]"));
+            assert!(value.contains("./skills/tools.md"));
+            assert!(value.contains("./skills/pedelec-cli.md"));
+        }
+    }
+
+    fn assert_provider_instruction_absent(command: &CommandSpec) {
+        for value in [&command.prompt, &command.stdin] {
+            assert!(!value.contains("[Hard Rules]"));
+            assert!(!value.contains("./skills/tools.md"));
+            assert!(!value.contains("./skills/pedelec-cli.md"));
+        }
+    }
+
+    fn collect_available_core_events(event_rx: &mpsc::Receiver<ThreadEvent>) -> Vec<ThreadEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.recv_timeout(Duration::from_millis(50)) {
+            events.push(event);
+        }
+        events
+    }
+}

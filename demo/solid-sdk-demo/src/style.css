@@ -1,0 +1,403 @@
+:root {
+  color: #1f2933;
+  background: #eef2f4;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  min-height: 36px;
+  border: 1px solid #176b73;
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #ffffff;
+  background: #176b73;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+button.secondary {
+  border-color: #9aa8b2;
+  color: #24343d;
+  background: #ffffff;
+}
+
+button.danger {
+  border-color: #a23b45;
+  background: #a23b45;
+}
+
+input,
+textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #c3cdd5;
+  border-radius: 6px;
+  padding: 9px 10px;
+  color: #1f2933;
+  background: #ffffff;
+}
+
+textarea {
+  resize: vertical;
+}
+
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid #cfdae1;
+  padding: 14px 18px;
+  background: #ffffff;
+}
+
+.topbar h1,
+.topbar p,
+.panel h2,
+.modal h2 {
+  margin: 0;
+}
+
+.topbar h1 {
+  font-size: 21px;
+  line-height: 1.2;
+}
+
+.topbar p {
+  margin-top: 4px;
+  color: #657581;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) minmax(420px, 1fr) minmax(300px, 360px);
+  gap: 14px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.left-pane,
+.center-pane,
+.right-pane {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+}
+
+.panel {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  border: 1px solid #d2dce3;
+  border-radius: 8px;
+  padding: 13px;
+  background: #ffffff;
+}
+
+.panel h2 {
+  color: #24343d;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.stack {
+  display: grid;
+  gap: 10px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: #3a4a55;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.status-grid,
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.info {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border-radius: 6px;
+  padding: 8px;
+  background: #f4f7f8;
+}
+
+.info span,
+.json-block span {
+  color: #687882;
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.info strong {
+  color: #1f2933;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.diagnostic {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #455661;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.session-list {
+  display: grid;
+  gap: 8px;
+}
+
+.session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border-color: #c8d4dc;
+  color: #24343d;
+  background: #ffffff;
+  text-align: left;
+}
+
+.session-row.active {
+  border-color: #176b73;
+  background: #eef8f8;
+}
+
+.session-row span {
+  overflow-wrap: anywhere;
+}
+
+.session-row strong {
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #ffffff;
+  background: #62717b;
+  font-size: 11px;
+}
+
+.session-row strong[data-status="idle"] {
+  background: #27734b;
+}
+
+.session-row strong[data-status="running"],
+.session-row strong[data-status="waiting_tool_result"] {
+  background: #8a651e;
+}
+
+.session-row strong[data-status="error"],
+.session-row strong[data-status="ended"] {
+  background: #a23b45;
+}
+
+.session-detail {
+  display: grid;
+  gap: 12px;
+}
+
+.transcript {
+  display: grid;
+  gap: 10px;
+  max-height: 430px;
+  overflow: auto;
+}
+
+.message,
+.tool-call,
+.error-row,
+.event-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid #d7e0e6;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fafbfc;
+}
+
+.message[data-role="user"] {
+  border-color: #bfd9dd;
+  background: #f1f8f8;
+}
+
+.message[data-role="assistant"] {
+  border-color: #d4d1e6;
+  background: #f6f5fb;
+}
+
+.message header,
+.tool-call header,
+.error-row header,
+.event-row header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #53636e;
+  font-size: 12px;
+}
+
+.message header strong,
+.tool-call header strong,
+.error-row header strong,
+.event-row header strong {
+  color: #24343d;
+}
+
+.send-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.tool-call[data-status="resolved"] {
+  border-color: #bbd8c5;
+}
+
+.tool-call[data-status="rejected"] {
+  border-color: #edbdc3;
+}
+
+.json-block {
+  display: grid;
+  gap: 5px;
+}
+
+.json-block pre,
+.error-row pre,
+.event-row pre {
+  border-radius: 6px;
+  padding: 8px;
+  background: #eef2f4;
+}
+
+.error-row {
+  border-color: #edbdc3;
+  background: #fff7f8;
+}
+
+.error-row p {
+  margin: 0;
+  color: #77303a;
+  font-size: 13px;
+}
+
+.error-row small,
+.event-row small {
+  color: #687882;
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  margin: 0;
+  color: #687882;
+  font-size: 13px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(20 31 39 / 55%);
+}
+
+.modal {
+  display: grid;
+  gap: 12px;
+  width: min(520px, 100%);
+  border-radius: 8px;
+  padding: 16px;
+  background: #ffffff;
+  box-shadow: 0 16px 50px rgb(20 31 39 / 25%);
+}
+
+.modal p {
+  margin: 0;
+  color: #455661;
+  line-height: 1.45;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+@media (max-width: 1120px) {
+  .layout {
+    grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+  }
+
+  .right-pane {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .topbar,
+  .send-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    display: grid;
+  }
+
+  .layout,
+  .right-pane,
+  .status-grid,
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  NODE_VERSION: "24"
+  REGISTRY_URL: "https://registry.npmjs.org"
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "Pedelec $TAG_NAME" \
+            --notes "Release bundle for Pedelec $TAG_NAME"
+
+  verify-versions:
+    name: Verify version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Verify package versions match tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            VERSION="${{ inputs.tag_name }}"
+            VERSION="${VERSION#v}"
+          fi
+
+          SDK_VERSION=$(node -p "require('./sdk/package.json').version")
+          DESKTOP_VERSION=$(node -p "require('./desktop/package.json').version")
+          EXT_VERSION=$(node -p "require('./extension/manifest.json').version")
+          TAURI_VERSION=$(node -p "require('./desktop/tauri/tauri.conf.json').version")
+          CARGO_VERSION=$(node - <<'NODE'
+          const fs = require('fs');
+          const text = fs.readFileSync('./desktop/tauri/Cargo.toml', 'utf8');
+          const m = text.match(/^version\s*=\s*"([^"]+)"/m);
+          console.log(m?.[1] ?? '');
+          NODE
+          )
+
+          echo "tag=$VERSION"
+          echo "sdk=$SDK_VERSION"
+          echo "desktop=$DESKTOP_VERSION"
+          echo "extension=$EXT_VERSION"
+          echo "tauri=$TAURI_VERSION"
+          echo "cargo=$CARGO_VERSION"
+
+          test "$SDK_VERSION" = "$VERSION"
+          test "$DESKTOP_VERSION" = "$VERSION"
+          test "$EXT_VERSION" = "$VERSION"
+          test "$TAURI_VERSION" = "$VERSION"
+          test "$CARGO_VERSION" = "$VERSION"
+
+  chrome-extension:
+    name: Package Chrome Extension
+    needs: [create-release, verify-versions]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package extension zip
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+
+          cd extension
+          zip -r "../dist/pedelec-chrome-extension-v${VERSION}.zip" . \
+            -x "*.test.js" \
+            -x "__tests__/*" \
+            -x ".DS_Store"
+
+      - name: Upload extension zip to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          gh release upload "$TAG_NAME" dist/*.zip --clobber
+
+  tauri:
+    name: Build Tauri - ${{ matrix.label }}
+    needs: [create-release, verify-versions]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            platform: windows-latest
+            args: ""
+            helper_target: ""
+          - label: macos-arm64
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            helper_target: "aarch64-apple-darwin"
+          - label: macos-x64
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            helper_target: "x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build and upload Tauri bundles
+        uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PEDELEC_HELPER_TARGET: ${{ matrix.helper_target }}
+        with:
+          projectPath: desktop
+          tauriScript: npm run tauri
+          tagName: ${{ inputs.tag_name || github.ref_name }}
+          releaseName: "Pedelec ${{ inputs.tag_name || github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+          assetNamePattern: "Pedelec-[version]-[platform]-[arch]-[bundle][ext]"
+
+  npm-publish:
+    name: Publish SDK to npm
+    needs: [verify-versions]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: ${{ env.REGISTRY_URL }}
+          cache: "npm"
+          cache-dependency-path: sdk/package-lock.json
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: npm ci
+
+      - name: Test SDK
+        working-directory: sdk
+        run: npm test
+
+      - name: Build SDK
+        working-directory: sdk
+        run: npm run build
+
+      - name: Publish SDK
+        working-directory: sdk
+        run: npm publish

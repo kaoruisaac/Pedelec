@@ -1,0 +1,25 @@
+{
+  "name": "pedelec-solid-sdk-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "solid-js": "latest",
+    "pedelec": "file:../../sdk"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vite-plugin-solid": "latest"
+  },
+  "volta": {
+    "node": "24.13.0"
+  }
+}
