@@ -15,7 +15,7 @@ Before using it, the user needs:
 - Pedelec Chrome Extension installed.
 - Pedelec Desktop App running.
 - Chrome Native Messaging host registered by the Desktop App.
-- The target provider CLI installed locally and available, such as `codex`, `gemini`, `opencode`, `cursor`, or `claude`.
+- The target provider available locally. CLI-backed providers use commands such as `codex`, `gemini`, `opencode`, `cursor`, or `claude`; the Ollama provider uses Pedelec's bundled `pedelec-agent`.
 
 ## Installation
 
@@ -124,7 +124,7 @@ for (const provider of providers) {
 ```
 
 ```ts
-type ProviderCode = "codex" | "gemini" | "opencode" | "cursor" | "claude";
+type ProviderCode = "codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama";
 
 type ProviderInfo = {
   name: string;
@@ -144,8 +144,10 @@ Supported provider codes:
 | OpenCode | `opencode` | `ollama/qwen2.5-coder:14b` |
 | Cursor | `cursor` | `gpt-5` |
 | Claude Code | `claude` | `sonnet` |
+| Ollama | `ollama` | `qwen3-14b-32k:latest` |
 
 `available: false` usually means the provider CLI is not installed or is not available in `PATH`.
+For Ollama, `available: true` only means Pedelec can find `pedelec-agent`; it does not mean the Ollama server is running or the selected model is installed.
 
 ## Settings
 
@@ -157,6 +159,7 @@ const settings = await pedelec.getSettings();
 console.log(settings.defaultProvider);
 console.log(settings.defaultModels.codex);
 console.log(settings.defaultModels.gemini);
+console.log(settings.defaultModels.ollama);
 ```
 
 ```ts
@@ -193,15 +196,18 @@ const session = await pedelec.createSession({
 ```
 
 When only `provider` is passed, the SDK uses that provider's own Desktop App default model if one is configured. Otherwise, it sends the provider without a model and lets the provider CLI use its own default behavior.
+Ollama is the exception: it requires a model, so provider-only Ollama sessions need `defaultModels.ollama` or they fail with `MODEL_REQUIRED`.
 
 Use an explicit provider and model:
 
 ```ts
 const session = await pedelec.createSession({
-  provider: "opencode",
-  model: "ollama/qwen2.5-coder:14b",
+  provider: "ollama",
+  model: "qwen3-14b-32k:latest",
 });
 ```
+
+Ollama sessions are executed by the `pedelec-agent` binary bundled with the Desktop App, not by the `ollama` CLI. You still need to start the local Ollama server yourself. Ollama requires a model from the session input or `defaultModels.ollama`; otherwise the CoreRuntime returns `MODEL_REQUIRED`.
 
 `model` cannot be provided without `provider`.
 

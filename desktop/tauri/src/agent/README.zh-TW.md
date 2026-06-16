@@ -17,30 +17,30 @@ cargo build --manifest-path desktop/tauri/Cargo.toml --bin pedelec-agent
 建立新 session 時不傳 session ID，`pedelec-agent` 會自行產生 UUID v7：
 
 ```bash
+printf '%s' '請讀取 README.md 並整理重點' | \
 cargo run --manifest-path desktop/tauri/Cargo.toml --bin pedelec-agent -- \
-  run \
-  "請讀取 README.md 並整理重點" \
   --sandbox .
 ```
 
-也可以使用 shorthand：
+也可以保留 `run` 作為相容入口：
 
 ```bash
+printf '%s' '請列出這個 sandbox 內有哪些文字檔' | \
 cargo run --manifest-path desktop/tauri/Cargo.toml --bin pedelec-agent -- \
-  "請列出這個 sandbox 內有哪些文字檔" \
+  run \
   --sandbox .
 ```
 
 若已經 build 出 binary：
 
 ```bash
-pedelec-agent run "請讀 README.md" --sandbox .
+printf '%s' '請讀 README.md' | pedelec-agent --sandbox .
 ```
 
 resume 既有 session 時使用 `--session-id`：
 
 ```bash
-pedelec-agent run "繼續剛才的分析" \
+printf '%s' '繼續剛才的分析' | pedelec-agent \
   --session-id 0197d8f0-8e3c-7b1a-a331-3fcf7b1f9176 \
   --sandbox .
 ```
@@ -48,7 +48,7 @@ pedelec-agent run "繼續剛才的分析" \
 ## 常用選項
 
 ```bash
-pedelec-agent run "prompt" \
+pedelec-agent [run] \
   --session-id <uuid-v7> \
   --sandbox <path> \
   --provider ollama \
@@ -61,7 +61,7 @@ pedelec-agent run "prompt" \
 
 | 選項 | 說明 |
 | --- | --- |
-| `"prompt"` | 使用者訊息。 |
+| stdin | 使用者訊息，從 stdin 讀取至 EOF。 |
 | `--session-id` | optional。提供既有 UUID v7 時 resume；省略時建立新 session。 |
 | `--sandbox` | 限制 agent 只能讀取此目錄內的檔案。 |
 | `--provider` | MVP 支援 `ollama`。 |
@@ -71,7 +71,7 @@ pedelec-agent run "prompt" \
 | `--pedelec-cli` | 指定 `pedelec-cli` 路徑。 |
 | `--core-runtime-file` | 呼叫 `pedelec-cli` 時傳入的 runtime file。 |
 
-舊格式 `pedelec-agent run <session_id> "prompt"` 與 `pedelec-agent <session_id> "prompt"` 不再支援。
+舊格式 `pedelec-agent run "prompt"`、`pedelec-agent "prompt"`、`pedelec-agent run <session_id> "prompt"` 與 `pedelec-agent <session_id> "prompt"` 不再是正式格式。Prompt 必須透過 stdin 傳入。
 
 ## `.env.local` 範例
 
@@ -88,6 +88,7 @@ PEDELEC_AGENT_MAX_TOOL_ROUNDS=8
 
 PEDELEC_CLI_PATH=
 PEDELEC_CORE_RUNTIME_FILE=
+PEDELEC_THREAD_ID=
 PEDELEC_AGENT_PEDELEC_CLI_TIMEOUT_MS=60000
 ```
 
@@ -144,16 +145,16 @@ stdout 每一行都是一個 JSON object：
 讀取 sandbox 內的 README：
 
 ```bash
-pedelec-agent run \
-  "請讀取 README.md 並用條列整理重點" \
+printf '%s' '請讀取 README.md 並用條列整理重點' | \
+pedelec-agent \
   --sandbox .
 ```
 
 指定 Ollama model：
 
 ```bash
-pedelec-agent run \
-  "請閱讀 sdk/src/index.ts 並說明 Pedelec SDK 的主要 API" \
+printf '%s' '請閱讀 sdk/src/index.ts 並說明 Pedelec SDK 的主要 API' | \
+pedelec-agent \
   --sandbox . \
   --provider ollama \
   --model qwen2.5-coder:7b
@@ -162,8 +163,8 @@ pedelec-agent run \
 透過 `pedelec-cli` 呼叫 host app tool：
 
 ```bash
-pedelec-agent run \
-  "請呼叫 get_current_page 並整理目前頁面資訊" \
+printf '%s' '請呼叫 get_current_page 並整理目前頁面資訊' | \
+PEDELEC_THREAD_ID=<pedelec_thread_id> pedelec-agent \
   --sandbox . \
   --pedelec-cli ./desktop/tauri/target/debug/pedelec-cli \
   --core-runtime-file ~/.pedelec/runtime.json
@@ -173,7 +174,7 @@ pedelec-agent run \
 
 - 只支援 Ollama provider。
 - 不支援 streaming；完成後輸出 `assistant_message`。
-- 不支援 stdin prompt。
+- Prompt 只支援 stdin。
 - 不會修改檔案。
 - 不會讀取 sandbox 以外的路徑。
 - `pedelec_cli.tool_call` 只會執行 `pedelec-cli tool-call`，不開放任意 shell。

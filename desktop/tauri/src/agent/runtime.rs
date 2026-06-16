@@ -10,6 +10,7 @@ use super::session::{
 };
 use super::tools::{execute_tool, tool_definitions};
 use serde_json::Value;
+use std::io::Read;
 use std::path::Path;
 
 const SYSTEM_PROMPT: &str = "You are pedelec-agent, a lightweight read-only assistant.\n\n\
@@ -48,8 +49,21 @@ fn run_inner_with_session_root(
     args: Vec<String>,
     session_root: Option<&Path>,
 ) -> Result<(), AgentError> {
+    let mut prompt = String::new();
+    std::io::stdin().read_to_string(&mut prompt)?;
+    run_inner_with_session_root_and_prompt(args, session_root, prompt)
+}
+
+fn run_inner_with_session_root_and_prompt(
+    args: Vec<String>,
+    session_root: Option<&Path>,
+    prompt: String,
+) -> Result<(), AgentError> {
     let cli = parse_args(args)?;
     let config = resolve_config(&cli)?;
+    if prompt.trim().is_empty() {
+        return Err(AgentError::new("INVALID_ARGUMENT", "Prompt is required."));
+    }
     let sandbox = Sandbox::new(
         &config.sandbox,
         config.max_file_bytes,
@@ -76,7 +90,7 @@ fn run_inner_with_session_root(
     let user_message = TranscriptMessage {
         role: "user".into(),
         name: None,
-        content: Value::String(cli.prompt.clone()),
+        content: Value::String(prompt),
     };
     append_transcript(&session, &user_message)?;
     transcript.push(user_message);
@@ -216,18 +230,40 @@ mod tests {
     #[test]
     fn exits_with_jsonl_for_missing_model() {
         let temp = tempfile::tempdir().unwrap();
-        let code = run_inner(vec![
-            "pedelec-agent".into(),
-            "run".into(),
+        let code = run_inner_with_session_root_and_prompt(
+            vec![
+                "pedelec-agent".into(),
+                "--env-file".into(),
+                temp.path()
+                    .join("missing.env")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            None,
             "hello".into(),
-            "--env-file".into(),
-            temp.path()
-                .join("missing.env")
-                .to_string_lossy()
-                .to_string(),
-        ]);
+        );
 
         assert!(code.is_err());
+    }
+
+    #[test]
+    fn rejects_empty_stdin_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let env_file = temp.path().join(".env.local");
+        std::fs::write(&env_file, "PEDELEC_AGENT_MODEL=fake\n").unwrap();
+        let err = run_inner_with_session_root_and_prompt(
+            vec![
+                "pedelec-agent".into(),
+                "--env-file".into(),
+                env_file.to_string_lossy().to_string(),
+            ],
+            None,
+            "  \n\t".into(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_ARGUMENT");
+        assert_eq!(err.message, "Prompt is required.");
     }
 
     #[test]
@@ -243,17 +279,16 @@ mod tests {
         .unwrap();
 
         let agent_home = temp.path().join("agent-home");
-        run_inner_with_session_root(
+        run_inner_with_session_root_and_prompt(
             vec![
                 "pedelec-agent".into(),
-                "run".into(),
-                "read".into(),
                 "--sandbox".into(),
                 temp.path().to_string_lossy().to_string(),
                 "--env-file".into(),
                 env_file.to_string_lossy().to_string(),
             ],
             Some(&agent_home),
+            "read".into(),
         )
         .unwrap();
         handle.join().unwrap();

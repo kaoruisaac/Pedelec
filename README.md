@@ -16,8 +16,8 @@ Chrome Extension Background
 pedelec-native-host
   ↓ Core IPC
 pedelec-app Desktop Runtime
-  ↓ provider CLI process
-Codex / Gemini / OpenCode / Cursor / Claude Code agent
+  ↓ provider process
+Codex / Gemini / OpenCode / Cursor / Claude Code / Ollama via pedelec-agent
 ```
 
 The Web App does not directly touch local processes and does not need to start its own localhost server. The SDK only communicates with the extension; the extension forwards requests to the native host; the desktop app is the only CoreRuntime owner and is responsible for creating sessions, managing provider processes, forwarding events, and handling tool results.
@@ -41,7 +41,7 @@ The Pedelec SDK must run in a browser page environment and requires:
 1. The user has installed the Pedelec Chrome Extension.
 2. The user has started the Pedelec Desktop App.
 3. The Desktop App has registered the Chrome Native Messaging host.
-4. The target provider CLI has been installed on the user's machine, such as `codex`, `gemini`, `opencode`, `cursor`, or `claude`.
+4. The target provider is available on the user's machine. CLI-backed providers use commands such as `codex`, `gemini`, `opencode`, `cursor`, or `claude`; the Ollama provider uses Pedelec's bundled `pedelec-agent`.
 
 The SDK is not suitable for direct use in Node.js, an SSR server, or a background worker; it needs extension runtime messaging from a Chrome page environment.
 
@@ -138,6 +138,16 @@ Currently supported provider codes in the SDK:
 | OpenCode | `opencode` | `ollama/qwen2.5-coder:14b` |
 | Cursor | `cursor` | `gpt-5` |
 | Claude Code | `claude` | `sonnet` |
+| Ollama | `ollama` | `qwen3-14b-32k:latest` |
+
+Ollama sessions are executed by the `pedelec-agent` binary bundled with the Desktop App, not by the `ollama` CLI. You still need to start the local Ollama server yourself and specify a model explicitly or configure `defaultModels.ollama` in Settings:
+
+```ts
+const session = await pedelec.createSession({
+  provider: "ollama",
+  model: "qwen3-14b-32k:latest",
+});
+```
 
 ### Using the Desktop App's Default Provider
 
@@ -160,6 +170,7 @@ const session = await pedelec.createSession({
 ```
 
 When only `provider` is passed, the SDK uses that provider's own Desktop App default model if one is configured. Otherwise, it sends the provider without a model and lets the provider CLI use its own default behavior.
+Ollama is the exception: it requires a model, so provider-only Ollama sessions need `defaultModels.ollama` or they fail with `MODEL_REQUIRED`.
 
 ---
 
@@ -178,7 +189,7 @@ Return format:
 ```ts
 type ProviderInfo = {
   name: string;
-  code: "codex" | "gemini" | "opencode" | "cursor" | "claude";
+  code: "codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama";
   path: string | null;
   available: boolean;
   error: string | null;
@@ -186,6 +197,7 @@ type ProviderInfo = {
 ```
 
 `available: false` usually means that the provider CLI is not installed or is not in `PATH`.
+For Ollama, `available: true` only means Pedelec can find `pedelec-agent`; it does not mean the Ollama server is running or the selected model is installed.
 
 ---
 
@@ -197,14 +209,15 @@ const settings = await pedelec.getSettings();
 console.log(settings.defaultProvider);
 console.log(settings.defaultModels.codex);
 console.log(settings.defaultModels.gemini);
+console.log(settings.defaultModels.ollama);
 ```
 
 Return format:
 
 ```ts
 type PedelecSettings = {
-  defaultProvider: "codex" | "gemini" | "opencode" | "cursor" | "claude" | null;
-  defaultModels: Partial<Record<"codex" | "gemini" | "opencode" | "cursor" | "claude", string>>;
+  defaultProvider: "codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama" | null;
+  defaultModels: Partial<Record<"codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama", string>>;
 };
 ```
 
@@ -356,7 +369,7 @@ Common errors:
 | `OPEN_POPUP_FAILED` | The extension could not automatically open the approval popup |
 | `NATIVE_HOST_UNAVAILABLE` | The Chrome Native Messaging host could not connect |
 | `DEFAULT_PROVIDER_NOT_SET` | The Desktop App has not configured a default provider |
-| `DEFAULT_PROVIDER_UNAVAILABLE` | The default provider CLI is unavailable |
+| `DEFAULT_PROVIDER_UNAVAILABLE` | The default provider is unavailable |
 | `SESSION_BUSY` | The same session already has a prompt running |
 | `SESSION_ENDED` | The session has ended |
 | `TOOL_HANDLER_NOT_FOUND` | The agent called a tool, but the Web App did not register a handler |
@@ -404,7 +417,7 @@ sequenceDiagram
 | Background | Manages SDK external channels, origin approval, native host connections, and converts core events into SDK events |
 | Native Host | Chrome Native Messaging entry point that forwards requests/events to Core IPC |
 | Desktop Runtime | The only session/runtime owner, managing threads, skills, provider processes, and tool requests |
-| Agent CLI | Actually runs Codex/Gemini/OpenCode/Cursor/Claude Code and calls frontend tools through `pedelec-cli` |
+| Agent process | Actually runs Codex/Gemini/OpenCode/Cursor/Claude Code/Ollama and calls frontend tools through `pedelec-cli` |
 
 ---
 

@@ -344,10 +344,20 @@ describe("Pedelec SDK", () => {
     respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: "codex", defaultModel: "gpt-5" });
     await expect(legacy).rejects.toMatchObject({ code: "SDK_PROTOCOL_ERROR" });
 
+    const ollamaSettings = pedelec.getSettings();
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "ollama",
+      defaultModels: { ollama: "qwen" },
+    });
+    await expect(ollamaSettings).resolves.toEqual({
+      defaultProvider: "ollama",
+      defaultModels: { ollama: "qwen" },
+    });
+
     const illegalKey = pedelec.getSettings();
     respondOk(pageWindow, pageWindow.lastSent(), {
       defaultProvider: "codex",
-      defaultModels: { ollama: "qwen" },
+      defaultModels: { unknown: "qwen" },
     });
     await expect(illegalKey).rejects.toMatchObject({ code: "SDK_PROTOCOL_ERROR" });
 
@@ -397,6 +407,55 @@ describe("Pedelec SDK", () => {
     expect(session.model).toBe("gpt-5");
   });
 
+  it("creates an ollama session with explicit model", async () => {
+    const pedelec = new Pedelec();
+    const promise = pedelec.createSession({
+      provider: "ollama",
+      model: "qwen3-14b-32k:latest",
+    });
+    const request = pageWindow.lastSent();
+
+    expect(request).toMatchObject({
+      type: "create_session",
+      input: {
+        provider: "ollama",
+        model: "qwen3-14b-32k:latest",
+        skillsUrls: [],
+      },
+    });
+    respondOk(pageWindow, request, { sessionId: "thread_ollama" });
+
+    const session = await promise;
+    expect(session.provider).toBe("ollama");
+    expect(session.model).toBe("qwen3-14b-32k:latest");
+  });
+
+  it("uses ollama as default provider with default model", async () => {
+    const pedelec = new Pedelec();
+    const promise = pedelec.createSession();
+
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "ollama",
+      defaultModels: { ollama: "qwen3-14b-32k:latest" },
+    });
+    await nextTick();
+    respondOk(pageWindow, pageWindow.lastSent(), [
+      { name: "Ollama", code: "ollama", path: "/bin/pedelec-agent", available: true, error: null },
+    ]);
+    await nextTick();
+
+    const createRequest = pageWindow.lastSent();
+    expect(createRequest).toMatchObject({
+      type: "create_session",
+      input: { provider: "ollama", model: "qwen3-14b-32k:latest", skillsUrls: [] },
+    });
+    respondOk(pageWindow, createRequest, { sessionId: "thread_ollama_default" });
+
+    const session = await promise;
+    expect(session.provider).toBe("ollama");
+    expect(session.model).toBe("qwen3-14b-32k:latest");
+  });
+
   it("applies the selected provider's default model", async () => {
     const pedelec = new Pedelec();
     const codexPromise = pedelec.createSession({ provider: "codex" });
@@ -426,6 +485,20 @@ describe("Pedelec SDK", () => {
     });
     respondOk(pageWindow, geminiCreate, { sessionId: "thread_gemini_no_default_model" });
     expect((await geminiPromise).model).toBe("gemini-2.5-pro");
+
+    const ollamaPromise = pedelec.createSession({ provider: "ollama" });
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "codex",
+      defaultModels: { codex: "gpt-5", ollama: "qwen3-14b-32k:latest" },
+    });
+    await nextTick();
+    const ollamaCreate = pageWindow.lastSent();
+    expect(ollamaCreate).toMatchObject({
+      type: "create_session",
+      input: { provider: "ollama", model: "qwen3-14b-32k:latest", skillsUrls: [] },
+    });
+    respondOk(pageWindow, ollamaCreate, { sessionId: "thread_ollama_default_model" });
+    expect((await ollamaPromise).model).toBe("qwen3-14b-32k:latest");
   });
 
   it("omits model when the selected provider has no default model", async () => {

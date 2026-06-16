@@ -62,7 +62,7 @@ pub fn tool_definitions() -> Value {
 pub fn execute_tool(
     tool: &str,
     args: &Value,
-    session_id: &str,
+    _session_id: &str,
     sandbox: &Sandbox,
     config: &AgentConfig,
 ) -> Result<Value, AgentError> {
@@ -84,7 +84,7 @@ pub fn execute_tool(
             let (text, truncated) = sandbox.read_text_file(path)?;
             Ok(serde_json::json!({ "path": path, "text": text, "truncated": truncated }))
         }
-        "pedelec_cli.tool_call" => pedelec_cli_tool_call(args, session_id, config),
+        "pedelec_cli.tool_call" => pedelec_cli_tool_call(args, config),
         _ => Err(AgentError::with_details(
             "INVALID_ARGUMENT",
             "Unknown tool",
@@ -93,11 +93,18 @@ pub fn execute_tool(
     }
 }
 
-fn pedelec_cli_tool_call(
-    args: &Value,
-    session_id: &str,
-    config: &AgentConfig,
-) -> Result<Value, AgentError> {
+fn pedelec_cli_tool_call(args: &Value, config: &AgentConfig) -> Result<Value, AgentError> {
+    let thread_id = config
+        .pedelec_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AgentError::new(
+                "PEDELEC_THREAD_ID_NOT_FOUND",
+                "Cannot call a Pedelec host tool without PEDELEC_THREAD_ID.",
+            )
+        })?;
     let tool_name = args
         .get("toolName")
         .and_then(Value::as_str)
@@ -120,7 +127,7 @@ fn pedelec_cli_tool_call(
     let mut command = Command::new(cli_path);
     command
         .arg("tool-call")
-        .arg(session_id)
+        .arg(thread_id)
         .arg(tool_name)
         .arg(json_args)
         .stdin(Stdio::null())
@@ -207,4 +214,126 @@ fn candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
         values.push(dir.join(format!("{program}.bat")));
     }
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::config::{AgentConfig, ModelProvider};
+
+    fn config(sandbox: PathBuf) -> AgentConfig {
+        AgentConfig {
+            provider: ModelProvider::Ollama,
+            provider_name: "ollama".into(),
+            model: "fake".into(),
+            ollama_base_url: "http://127.0.0.1:1".into(),
+            ollama_timeout_ms: 1000,
+            sandbox,
+            pedelec_cli_path: None,
+            core_runtime_file: None,
+            pedelec_thread_id: None,
+            max_transcript_bytes: 1024,
+            max_tool_rounds: 8,
+            max_list_files: 200,
+            max_file_bytes: 1024,
+            pedelec_cli_timeout_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn filesystem_tool_does_not_require_pedelec_thread_id() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("README.md"), "hello").unwrap();
+        let sandbox = Sandbox::new(temp.path(), 1024, 200).unwrap();
+        let cfg = config(temp.path().to_path_buf());
+
+        let result = execute_tool(
+            "fs.read_text_file",
+            &serde_json::json!({ "path": "README.md" }),
+            "session_inner",
+            &sandbox,
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(result["text"], "hello");
+    }
+
+    #[test]
+    fn host_tool_requires_pedelec_thread_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(temp.path(), 1024, 200).unwrap();
+        let cfg = config(temp.path().to_path_buf());
+
+        let err = execute_tool(
+            "pedelec_cli.tool_call",
+            &serde_json::json!({ "toolName": "get_page", "args": {} }),
+            "session_inner",
+            &sandbox,
+            &cfg,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, "PEDELEC_THREAD_ID_NOT_FOUND");
+    }
+
+    #[test]
+    fn host_tool_passes_outer_thread_id_to_pedelec_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().join("args.txt");
+        let cli = fake_pedelec_cli(temp.path(), &capture);
+        let sandbox = Sandbox::new(temp.path(), 1024, 200).unwrap();
+        let mut cfg = config(temp.path().to_path_buf());
+        cfg.pedelec_cli_path = Some(cli);
+        cfg.pedelec_thread_id = Some("thread_outer".into());
+
+        let result = execute_tool(
+            "pedelec_cli.tool_call",
+            &serde_json::json!({ "toolName": "get_page", "args": { "id": 1 } }),
+            "session_inner",
+            &sandbox,
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(result["ok"], true);
+        let args = std::fs::read_to_string(capture).unwrap();
+        assert!(args.contains("tool-call"));
+        assert!(args.contains("thread_outer"));
+        assert!(args.contains("get_page"));
+        assert!(!args.contains("session_inner"));
+    }
+
+    #[cfg(windows)]
+    fn fake_pedelec_cli(dir: &Path, capture: &Path) -> PathBuf {
+        let path = dir.join("pedelec-cli.cmd");
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off\r\necho %* > \"{}\"\r\necho {{\"ok\":true}}\r\n",
+                capture.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[cfg(not(windows))]
+    fn fake_pedelec_cli(dir: &Path, capture: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("pedelec-cli");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' '{{\"ok\":true}}'\n",
+                capture.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
 }

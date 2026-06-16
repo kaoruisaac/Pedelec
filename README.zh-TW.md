@@ -16,8 +16,8 @@ Chrome Extension Background
 pedelec-native-host
   ↓ Core IPC
 pedelec-app Desktop Runtime
-  ↓ provider CLI process
-Codex / Gemini / OpenCode / Cursor / Claude Code agent
+  ↓ provider process
+Codex / Gemini / OpenCode / Cursor / Claude Code / Ollama via pedelec-agent
 ```
 
 Web App 不直接碰本機 process，也不需要自己開 localhost server。SDK 只負責和 extension 溝通；extension 負責把請求送到 native host；desktop app 是唯一的 CoreRuntime owner，真正負責建立 session、管理 provider process、轉發事件與處理 tool result。
@@ -41,7 +41,7 @@ Pedelec SDK 必須在瀏覽器頁面環境中執行，並且需要：
 1. 使用者已安裝 Pedelec Chrome Extension。
 2. 使用者已啟動 Pedelec Desktop App。
 3. Desktop App 已註冊 Chrome Native Messaging host。
-4. 目標 provider CLI 已安裝在使用者本機，例如 `codex`、`gemini`、`opencode`、`cursor` 或 `claude`。
+4. 目標 provider 在使用者本機可用。CLI 型 provider 使用 `codex`、`gemini`、`opencode`、`cursor` 或 `claude`；Ollama provider 使用 Pedelec 隨附的 `pedelec-agent`。
 
 SDK 不適合直接在 Node.js、SSR server 或 background worker 裡使用；它需要 Chrome 頁面環境中的 extension runtime messaging。
 
@@ -138,6 +138,16 @@ const session = await pedelec.createSession({
 | OpenCode | `opencode` | `ollama/qwen2.5-coder:14b` |
 | Cursor | `cursor` | `gpt-5` |
 | Claude Code | `claude` | `sonnet` |
+| Ollama | `ollama` | `qwen3-14b-32k:latest` |
+
+Ollama session 由 Desktop App 隨附的 `pedelec-agent` 執行，不會直接啟動 `ollama` CLI。使用者仍需自行啟動本機 Ollama server，且必須明確指定 model 或在 Settings 設定 `defaultModels.ollama`：
+
+```ts
+const session = await pedelec.createSession({
+  provider: "ollama",
+  model: "qwen3-14b-32k:latest",
+});
+```
 
 ### 使用 Desktop App 預設 provider
 
@@ -160,6 +170,7 @@ const session = await pedelec.createSession({
 ```
 
 只傳 `provider` 時，SDK 會使用該 provider 在 Desktop App 中設定的 default model；若該 provider 未設定 model，則只傳 provider，讓 provider CLI 使用自己的預設行為。
+Ollama 是例外：它必須有 model，因此只傳 Ollama provider 時需要 `defaultModels.ollama`，否則會回傳 `MODEL_REQUIRED`。
 
 ---
 
@@ -178,7 +189,7 @@ for (const provider of providers) {
 ```ts
 type ProviderInfo = {
   name: string;
-  code: "codex" | "gemini" | "opencode" | "cursor" | "claude";
+  code: "codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama";
   path: string | null;
   available: boolean;
   error: string | null;
@@ -186,6 +197,7 @@ type ProviderInfo = {
 ```
 
 `available: false` 通常代表該 provider CLI 沒有安裝，或不在 PATH 裡。
+對 Ollama 而言，`available: true` 只代表 Pedelec 找得到 `pedelec-agent`；不代表 Ollama server 已啟動，也不代表指定 model 已下載。
 
 ---
 
@@ -197,14 +209,15 @@ const settings = await pedelec.getSettings();
 console.log(settings.defaultProvider);
 console.log(settings.defaultModels.codex);
 console.log(settings.defaultModels.gemini);
+console.log(settings.defaultModels.ollama);
 ```
 
 回傳格式：
 
 ```ts
 type PedelecSettings = {
-  defaultProvider: "codex" | "gemini" | "opencode" | "cursor" | "claude" | null;
-  defaultModels: Partial<Record<"codex" | "gemini" | "opencode" | "cursor" | "claude", string>>;
+  defaultProvider: "codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama" | null;
+  defaultModels: Partial<Record<"codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama", string>>;
 };
 ```
 
@@ -356,7 +369,7 @@ try {
 | `OPEN_POPUP_FAILED` | extension 無法自動開啟 approval popup |
 | `NATIVE_HOST_UNAVAILABLE` | Chrome Native Messaging host 無法連線 |
 | `DEFAULT_PROVIDER_NOT_SET` | Desktop App 尚未設定 default provider |
-| `DEFAULT_PROVIDER_UNAVAILABLE` | default provider CLI 不可用 |
+| `DEFAULT_PROVIDER_UNAVAILABLE` | default provider 不可用 |
 | `SESSION_BUSY` | 同一個 session 已有 prompt 正在執行 |
 | `SESSION_ENDED` | session 已結束 |
 | `TOOL_HANDLER_NOT_FOUND` | agent 呼叫 tool，但 Web App 沒有註冊 handler |
@@ -404,7 +417,7 @@ sequenceDiagram
 | Background | 管理 SDK external channel、origin approval、連線 native host、把 core event 轉成 SDK event |
 | Native Host | Chrome Native Messaging 入口，轉送 request/event 到 Core IPC |
 | Desktop Runtime | 唯一的 session/runtime owner，管理 thread、skills、provider process 與 tool request |
-| Agent CLI | 實際執行 Codex/Gemini/OpenCode/Cursor/Claude Code，並透過 `pedelec-cli` 呼叫前端工具 |
+| Agent process | 實際執行 Codex/Gemini/OpenCode/Cursor/Claude Code/Ollama，並透過 `pedelec-cli` 呼叫前端工具 |
 
 ---
 

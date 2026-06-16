@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 
-type ProviderCode = "codex" | "gemini" | "opencode" | "cursor" | "claude";
+type ProviderCode = "codex" | "gemini" | "opencode" | "cursor" | "claude" | "ollama";
 
 interface Provider {
   code: ProviderCode;

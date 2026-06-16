@@ -207,6 +207,7 @@ pub enum ProviderCode {
     OpenCode,
     Cursor,
     Claude,
+    Ollama,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -483,6 +484,7 @@ enum ProviderAdapterInstance {
     OpenCode(OpenCodeProviderAdapter),
     Cursor(CursorProviderAdapter),
     Claude(ClaudeProviderAdapter),
+    Ollama(OllamaProviderAdapter),
 }
 
 impl ProviderAdapterInstance {
@@ -493,6 +495,7 @@ impl ProviderAdapterInstance {
             ProviderCode::OpenCode => Self::OpenCode(OpenCodeProviderAdapter::default()),
             ProviderCode::Cursor => Self::Cursor(CursorProviderAdapter::default()),
             ProviderCode::Claude => Self::Claude(ClaudeProviderAdapter::default()),
+            ProviderCode::Ollama => Self::Ollama(OllamaProviderAdapter::default()),
         }
     }
 }
@@ -505,6 +508,7 @@ impl ProviderAdapter for ProviderAdapterInstance {
             Self::OpenCode(adapter) => adapter.code(),
             Self::Cursor(adapter) => adapter.code(),
             Self::Claude(adapter) => adapter.code(),
+            Self::Ollama(adapter) => adapter.code(),
         }
     }
 
@@ -515,6 +519,7 @@ impl ProviderAdapter for ProviderAdapterInstance {
             Self::OpenCode(adapter) => adapter.capabilities(),
             Self::Cursor(adapter) => adapter.capabilities(),
             Self::Claude(adapter) => adapter.capabilities(),
+            Self::Ollama(adapter) => adapter.capabilities(),
         }
     }
 
@@ -529,6 +534,7 @@ impl ProviderAdapter for ProviderAdapterInstance {
             Self::OpenCode(adapter) => adapter.build_run_command(ctx, message),
             Self::Cursor(adapter) => adapter.build_run_command(ctx, message),
             Self::Claude(adapter) => adapter.build_run_command(ctx, message),
+            Self::Ollama(adapter) => adapter.build_run_command(ctx, message),
         }
     }
 
@@ -552,6 +558,9 @@ impl ProviderAdapter for ProviderAdapterInstance {
             Self::Claude(adapter) => {
                 adapter.build_resume_command(ctx, provider_session_id, message)
             }
+            Self::Ollama(adapter) => {
+                adapter.build_resume_command(ctx, provider_session_id, message)
+            }
         }
     }
 
@@ -562,6 +571,7 @@ impl ProviderAdapter for ProviderAdapterInstance {
             Self::OpenCode(adapter) => adapter.parse_stdout_event(chunk),
             Self::Cursor(adapter) => adapter.parse_stdout_event(chunk),
             Self::Claude(adapter) => adapter.parse_stdout_event(chunk),
+            Self::Ollama(adapter) => adapter.parse_stdout_event(chunk),
         }
     }
 
@@ -572,6 +582,7 @@ impl ProviderAdapter for ProviderAdapterInstance {
             Self::OpenCode(adapter) => adapter.parse_stderr_event(chunk),
             Self::Cursor(adapter) => adapter.parse_stderr_event(chunk),
             Self::Claude(adapter) => adapter.parse_stderr_event(chunk),
+            Self::Ollama(adapter) => adapter.parse_stderr_event(chunk),
         }
     }
 }
@@ -1041,6 +1052,95 @@ impl ProviderAdapter for ClaudeProviderAdapter {
 
     fn parse_stderr_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
         parse_claude_provider_chunk(&mut self.stderr_buffer, chunk)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct OllamaProviderAdapter {
+    stdout_buffer: String,
+}
+
+impl ProviderAdapter for OllamaProviderAdapter {
+    fn code(&self) -> ProviderCode {
+        ProviderCode::Ollama
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_json_events: true,
+            supports_resume_by_session_id: true,
+            supports_user_supplied_session_id: false,
+            supports_provider_generated_session_id_parse: true,
+            supports_resume_last_session: false,
+        }
+    }
+
+    fn build_run_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        let model = required_ollama_model(&ctx.thread)?;
+        let args = vec![
+            "--provider".to_string(),
+            "ollama".to_string(),
+            "--model".to_string(),
+            model,
+            "--sandbox".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+        ];
+        let prompt = build_provider_run_prompt(&ctx.thread, message);
+        Ok(CommandSpec {
+            program: "pedelec-agent".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn build_resume_command(
+        &self,
+        ctx: &RunPromptProviderContext,
+        provider_session_id: &str,
+        message: &str,
+    ) -> Result<CommandSpec, PedelecError> {
+        if provider_session_id.trim().is_empty() {
+            return Err(provider_unsupported_error(
+                &ctx.thread,
+                "ollama resume requires a provider session id",
+            ));
+        }
+
+        let model = required_ollama_model(&ctx.thread)?;
+        let args = vec![
+            "--provider".to_string(),
+            "ollama".to_string(),
+            "--model".to_string(),
+            model,
+            "--sandbox".to_string(),
+            ctx.thread.sandbox_path.to_string_lossy().to_string(),
+            "--session-id".to_string(),
+            provider_session_id.to_string(),
+        ];
+        let prompt = build_provider_resume_prompt(message);
+        Ok(CommandSpec {
+            program: "pedelec-agent".to_string(),
+            args,
+            cwd: ctx.thread.sandbox_path.clone(),
+            env: build_provider_env(ctx)?,
+            prompt: prompt.clone(),
+            stdin: prompt,
+        })
+    }
+
+    fn parse_stdout_event(&mut self, chunk: &str) -> Vec<ThreadEventPartial> {
+        parse_pedelec_agent_provider_chunk(&mut self.stdout_buffer, chunk)
+    }
+
+    fn parse_stderr_event(&mut self, _chunk: &str) -> Vec<ThreadEventPartial> {
+        Vec::new()
     }
 }
 
@@ -1921,7 +2021,10 @@ impl SandboxManager {
         }
     }
 
-    pub fn remove_thread_sandbox(&self, sandbox_path: impl AsRef<Path>) -> Result<(), PedelecError> {
+    pub fn remove_thread_sandbox(
+        &self,
+        sandbox_path: impl AsRef<Path>,
+    ) -> Result<(), PedelecError> {
         let sandbox_path = sandbox_path.as_ref();
         if !sandbox_path.exists() {
             return Ok(());
@@ -2394,7 +2497,10 @@ struct RawToolDefinition {
     timeout_ms: Option<u64>,
 }
 
-fn parse_tool_timeout_override(tool_name: &str, timeout_value: &Value) -> Result<u64, PedelecError> {
+fn parse_tool_timeout_override(
+    tool_name: &str,
+    timeout_value: &Value,
+) -> Result<u64, PedelecError> {
     timeout_value
         .as_u64()
         .filter(|timeout_ms| *timeout_ms > 0)
@@ -2757,6 +2863,7 @@ pub mod error_codes {
     pub const NATIVE_CONNECTION_CLOSED: &str = "NATIVE_CONNECTION_CLOSED";
     pub const DEFAULT_PROVIDER_NOT_SET: &str = "DEFAULT_PROVIDER_NOT_SET";
     pub const DEFAULT_PROVIDER_UNAVAILABLE: &str = "DEFAULT_PROVIDER_UNAVAILABLE";
+    pub const MODEL_REQUIRED: &str = "MODEL_REQUIRED";
     pub const SETTINGS_READ_FAILED: &str = "SETTINGS_READ_FAILED";
     pub const SETTINGS_WRITE_FAILED: &str = "SETTINGS_WRITE_FAILED";
 }
@@ -2768,6 +2875,7 @@ fn provider_code_as_str(provider: &ProviderCode) -> &'static str {
         ProviderCode::OpenCode => "opencode",
         ProviderCode::Cursor => "cursor",
         ProviderCode::Claude => "claude",
+        ProviderCode::Ollama => "ollama",
     }
 }
 
@@ -2778,6 +2886,7 @@ fn provider_display_name(provider: &ProviderCode) -> &'static str {
         ProviderCode::OpenCode => "OpenCode",
         ProviderCode::Cursor => "Cursor",
         ProviderCode::Claude => "Claude Code",
+        ProviderCode::Ollama => "Ollama",
     }
 }
 
@@ -2788,6 +2897,7 @@ fn provider_program_name(provider: &ProviderCode) -> &'static str {
         ProviderCode::OpenCode => "opencode",
         ProviderCode::Cursor => "agent",
         ProviderCode::Claude => "claude",
+        ProviderCode::Ollama => "pedelec-agent",
     }
 }
 
@@ -2798,6 +2908,7 @@ fn list_provider_infos(path_value: Option<OsString>) -> Vec<ProviderInfo> {
         ProviderCode::OpenCode,
         ProviderCode::Cursor,
         ProviderCode::Claude,
+        ProviderCode::Ollama,
     ]
     .into_iter()
     .map(|provider| provider_info_for(provider, path_value.as_ref()))
@@ -2976,12 +3087,31 @@ fn add_model_args(args: &mut Vec<String>, model: &Option<String>, flag: &str) {
     }
 }
 
+fn required_ollama_model(thread: &ThreadState) -> Result<String, PedelecError> {
+    thread
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::MODEL_REQUIRED,
+                "Ollama provider requires a model.",
+                serde_json::json!({ "provider": "ollama" }),
+            )
+        })
+}
+
 fn build_provider_env(
     ctx: &RunPromptProviderContext,
 ) -> Result<Vec<(String, String)>, PedelecError> {
     let provider = provider_code_as_str(&ctx.thread.provider).to_string();
     let mut env = vec![
-        ("PEDELEC_THREAD_ID".to_string(), ctx.thread.thread_id.clone()),
+        (
+            "PEDELEC_THREAD_ID".to_string(),
+            ctx.thread.thread_id.clone(),
+        ),
         ("PEDELEC_PROVIDER".to_string(), provider),
         (
             "PEDELEC_SANDBOX_PATH".to_string(),
@@ -3157,6 +3287,32 @@ fn parse_claude_provider_chunk(buffer: &mut String, chunk: &str) -> Vec<ThreadEv
     events
 }
 
+fn parse_pedelec_agent_provider_chunk(buffer: &mut String, chunk: &str) -> Vec<ThreadEventPartial> {
+    buffer.push_str(chunk);
+    let mut events: Vec<ThreadEventPartial> = Vec::new();
+
+    while let Some(newline_index) = buffer.find('\n') {
+        let mut line = buffer[..newline_index].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        buffer.drain(..=newline_index);
+        events.extend(parse_pedelec_agent_provider_line(&line));
+    }
+
+    if buffer.len() > 64 * 1024 {
+        buffer.clear();
+        events.push(ThreadEventPartial::ProviderError {
+            error: PedelecError::new(
+                error_codes::PROVIDER_COMMAND_FAILED,
+                "pedelec-agent emitted an unterminated JSON event",
+            ),
+        });
+    }
+
+    events
+}
+
 fn parse_opencode_provider_line(line: &str) -> Vec<ThreadEventPartial> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -3260,6 +3416,86 @@ fn parse_claude_provider_line(line: &str) -> Vec<ThreadEventPartial> {
         events.push(ThreadEventPartial::AssistantMessage { text });
     }
     events
+}
+
+fn parse_pedelec_agent_provider_line(line: &str) -> Vec<ThreadEventPartial> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if !trimmed.starts_with('{') {
+        return Vec::new();
+    }
+
+    let value = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            return vec![ThreadEventPartial::ProviderError {
+                error: PedelecError::with_details(
+                    error_codes::PROVIDER_COMMAND_FAILED,
+                    "pedelec-agent emitted invalid JSON",
+                    serde_json::json!({
+                        "line": trimmed,
+                        "error": err.to_string()
+                    }),
+                ),
+            }]
+        }
+    };
+
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    match object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "session" => object
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .map(|session_id| {
+                vec![ThreadEventPartial::ProviderSessionIdUpdated {
+                    provider_session_id: session_id.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "assistant_message" => object
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                vec![ThreadEventPartial::AssistantMessage {
+                    text: text.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "error" => {
+            let error = object.get("error").unwrap_or(&Value::Null);
+            let code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(error_codes::PROVIDER_COMMAND_FAILED);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("pedelec-agent failed");
+            let details = error.get("details").cloned().unwrap_or(Value::Null);
+            let error = if details.is_null() {
+                PedelecError::new(code, message)
+            } else {
+                PedelecError::with_details(code, message, details)
+            };
+            vec![ThreadEventPartial::ProviderError { error }]
+        }
+        "status" | "tool_call" | "tool_result" | "done" => Vec::new(),
+        _ => Vec::new(),
+    }
 }
 
 fn parse_provider_line(
@@ -3862,12 +4098,20 @@ mod tests {
             json!("claude")
         );
         assert_eq!(
+            serde_json::to_value(ProviderCode::Ollama).unwrap(),
+            json!("ollama")
+        );
+        assert_eq!(
             serde_json::from_value::<ProviderCode>(json!("cursor")).unwrap(),
             ProviderCode::Cursor
         );
         assert_eq!(
             serde_json::from_value::<ProviderCode>(json!("claude")).unwrap(),
             ProviderCode::Claude
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderCode>(json!("ollama")).unwrap(),
+            ProviderCode::Ollama
         );
     }
 
@@ -4571,6 +4815,221 @@ mod tests {
     }
 
     #[test]
+    fn ollama_new_command_uses_pedelec_agent_model_sandbox_and_stdin_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_ollama_new",
+            ProviderCode::Ollama,
+            None,
+            Some("qwen3-14b-32k:latest".into()),
+        );
+        let message = "line 1\n{\"quote\":\"hello \\\"world\\\"\"}\n中文";
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_ollama_new".into(),
+                message: message.into(),
+            })
+            .unwrap();
+
+        let sandbox_path = temp.path().join("sandbox").join("thread_ollama_new");
+        assert_eq!(start.command.program, "pedelec-agent");
+        assert_eq!(
+            start.command.args,
+            vec![
+                "--provider",
+                "ollama",
+                "--model",
+                "qwen3-14b-32k:latest",
+                "--sandbox",
+                sandbox_path.to_str().unwrap(),
+            ]
+        );
+        assert_eq!(start.command.cwd, sandbox_path);
+        assert!(start.command.stdin.ends_with(message));
+        assert_provider_instruction_present(&start.command);
+        assert!(!start.command.args.iter().any(|arg| arg == message));
+        assert!(!start.command.args.iter().any(|arg| arg == "--session-id"));
+        assert_env(&start.command, "PEDELEC_THREAD_ID", "thread_ollama_new");
+        assert_env(&start.command, "PEDELEC_PROVIDER", "ollama");
+        assert_env(&start.command, "PEDELEC_MODEL", "qwen3-14b-32k:latest");
+        assert!(env_value(&start.command, "PATH")
+            .unwrap()
+            .contains(".pedelec"));
+    }
+
+    #[test]
+    fn ollama_resume_uses_provider_session_id_and_outer_thread_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_session_id = "0197d8f0-8e3c-7b1a-a331-3fcf7b1f9176";
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_outer",
+            ProviderCode::Ollama,
+            Some(provider_session_id.into()),
+            Some("model-a".into()),
+        );
+
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_outer".into(),
+                message: "continue".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            start.command.args,
+            vec![
+                "--provider",
+                "ollama",
+                "--model",
+                "model-a",
+                "--sandbox",
+                temp.path()
+                    .join("sandbox")
+                    .join("thread_outer")
+                    .to_str()
+                    .unwrap(),
+                "--session-id",
+                provider_session_id,
+            ]
+        );
+        assert_eq!(start.command.prompt, "continue");
+        assert_eq!(start.command.stdin, "continue");
+        assert_provider_instruction_absent(&start.command);
+        assert_env(&start.command, "PEDELEC_THREAD_ID", "thread_outer");
+        assert_ne!(provider_session_id, "thread_outer");
+    }
+
+    #[test]
+    fn ollama_requires_explicit_model_before_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_ollama_no_model",
+            ProviderCode::Ollama,
+            None,
+            Some("   ".into()),
+        );
+
+        let err = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_ollama_no_model".into(),
+                message: "hello".into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(err.code, error_codes::MODEL_REQUIRED);
+        assert_eq!(err.message, "Ollama provider requires a model.");
+        assert_eq!(err.details.unwrap()["provider"], "ollama");
+        assert_eq!(
+            runtime.thread_status("thread_ollama_no_model"),
+            Some(ThreadStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn ollama_parser_maps_only_pedelec_agent_public_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_ollama_parse",
+            ProviderCode::Ollama,
+            None,
+            Some("model-a".into()),
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_ollama_parse");
+
+        runtime.emit_provider_stdout(
+            "thread_ollama_parse",
+            concat!(
+                "{\"type\":\"session\",\"sessionId\":\"0197d8f0-8e3c-7b1a-a331-3fcf7b1f9176\",\"resumed\":false}\r\n",
+                "{\"type\":\"assistant_message\",\"text\":\"hello\"}\n",
+                "{\"type\":\"status\",\"status\":\"running\"}\n",
+                "{\"type\":\"tool_call\",\"tool\":\"pedelec_cli.tool_call\",\"args\":{\"message\":\"ignore\"}}\n",
+                "{\"type\":\"tool_result\",\"tool\":\"pedelec_cli.tool_call\",\"ok\":true,\"result\":{\"message\":\"ignore\"}}\n",
+                "{\"type\":\"done\"}\n"
+            )
+            .into(),
+        );
+        runtime.emit_provider_stdout(
+            "thread_ollama_parse",
+            "{\"type\":\"assistant_message\",\"text\":\"chunk".into(),
+        );
+        runtime.emit_provider_stdout("thread_ollama_parse", "ed\"}\n".into());
+
+        assert_eq!(
+            runtime
+                .provider_state("thread_ollama_parse")
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("0197d8f0-8e3c-7b1a-a331-3fcf7b1f9176")
+        );
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "hello")
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "chunked")
+        ));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event,
+                ThreadEvent::ToolCall { .. } | ThreadEvent::ToolResult { .. }
+            )
+        }));
+        assert!(events.iter().all(
+            |event| !matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "ignore")
+        ));
+    }
+
+    #[test]
+    fn ollama_parser_preserves_structured_error_and_rejects_invalid_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_ollama_error",
+            ProviderCode::Ollama,
+            None,
+            Some("model-a".into()),
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_ollama_error");
+
+        runtime.emit_provider_stdout(
+            "thread_ollama_error",
+            r#"{"type":"error","error":{"code":"OLLAMA_UNAVAILABLE","message":"Ollama request failed","details":{"status":500,"message":"body message"}}}"#
+                .to_string()
+                + "\n",
+        );
+        runtime.emit_provider_stdout("thread_ollama_error", "{not-json}\n".into());
+
+        let events = collect_available_core_events(&event_rx);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ThreadEvent::Error { error, .. }
+                    if error.code == "OLLAMA_UNAVAILABLE"
+                        && error.message == "Ollama request failed"
+                        && error.details.as_ref().and_then(|details| details.get("status")) == Some(&json!(500))
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ThreadEvent::Error { error, .. }
+                    if error.code == error_codes::PROVIDER_COMMAND_FAILED
+                        && error.message == "pedelec-agent emitted invalid JSON"
+                        && error.details.as_ref().and_then(|details| details.get("line")) == Some(&json!("{not-json}"))
+            )
+        }));
+        assert!(events.iter().all(
+            |event| !matches!(event, ThreadEvent::AssistantMessage { text, .. } if text == "body message")
+        ));
+    }
+
+    #[test]
     fn list_providers_includes_opencode_unavailable_without_panic() {
         let providers = list_provider_infos(Some(OsString::from("")));
         let opencode = providers
@@ -4613,6 +5072,22 @@ mod tests {
     }
 
     #[test]
+    fn list_providers_includes_ollama_using_pedelec_agent_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_path = test_provider_path(temp.path(), "pedelec-agent");
+        let providers = list_provider_infos(Some(provider_path));
+        let ollama = providers
+            .iter()
+            .find(|provider| provider.code == ProviderCode::Ollama)
+            .unwrap();
+
+        assert_eq!(ollama.name, "Ollama");
+        assert!(ollama.available);
+        assert!(ollama.path.as_deref().unwrap().contains("pedelec-agent"));
+        assert_eq!(ollama.error, None);
+    }
+
+    #[test]
     fn list_providers_uses_expected_order() {
         let providers = list_provider_infos(Some(OsString::from("")));
         let codes = providers
@@ -4628,6 +5103,7 @@ mod tests {
                 ProviderCode::OpenCode,
                 ProviderCode::Cursor,
                 ProviderCode::Claude,
+                ProviderCode::Ollama,
             ]
         );
     }
@@ -4648,7 +5124,7 @@ mod tests {
     #[test]
     fn update_settings_persists_provider_and_default_models() {
         let temp = tempfile::tempdir().unwrap();
-        let provider_path = test_provider_path(temp.path(), "codex");
+        let provider_path = test_provider_path(temp.path(), "pedelec-agent");
         let settings_path = temp.path().join("settings.json");
         let mut runtime = CoreRuntime {
             settings_file_path: Some(settings_path.clone()),
@@ -4658,10 +5134,10 @@ mod tests {
 
         let saved = runtime
             .update_settings(UpdateSettingsInput {
-                default_provider: ProviderCode::Codex,
+                default_provider: ProviderCode::Ollama,
                 default_models: HashMap::from([
                     (ProviderCode::Codex, "gpt-5".into()),
-                    (ProviderCode::Gemini, "gemini-2.5-pro".into()),
+                    (ProviderCode::Ollama, "qwen3-14b-32k:latest".into()),
                 ]),
             })
             .unwrap();
@@ -4669,10 +5145,10 @@ mod tests {
         assert_eq!(
             saved,
             PedelecSettings {
-                default_provider: Some(ProviderCode::Codex),
+                default_provider: Some(ProviderCode::Ollama),
                 default_models: HashMap::from([
                     (ProviderCode::Codex, "gpt-5".into()),
-                    (ProviderCode::Gemini, "gemini-2.5-pro".into()),
+                    (ProviderCode::Ollama, "qwen3-14b-32k:latest".into()),
                 ]),
             }
         );
