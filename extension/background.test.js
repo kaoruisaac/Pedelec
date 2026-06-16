@@ -600,7 +600,9 @@ test("SDK get_settings routes to native host", async () => {
   assert.equal(nativePort.lastSent().type, "get_settings");
   respondNative(nativePort, nativePort.lastSent(), {
     defaultProvider: "codex",
-    defaultModel: "gpt-5",
+    defaultModels: {
+      codex: "gpt-5",
+    },
   });
   await tick();
 
@@ -611,7 +613,9 @@ test("SDK get_settings routes to native host", async () => {
     ok: true,
     result: {
       defaultProvider: "codex",
-      defaultModel: "gpt-5",
+      defaultModels: {
+        codex: "gpt-5",
+      },
     },
   });
   assert.equal(nativePort.disconnectCallCount, 1);

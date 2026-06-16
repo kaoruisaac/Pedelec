@@ -149,19 +149,20 @@ Supported provider codes:
 
 ## Settings
 
-Read the Desktop App default provider and model:
+Read the Desktop App default provider and per-provider models:
 
 ```ts
 const settings = await pedelec.getSettings();
 
 console.log(settings.defaultProvider);
-console.log(settings.defaultModel);
+console.log(settings.defaultModels.codex);
+console.log(settings.defaultModels.gemini);
 ```
 
 ```ts
 type PedelecSettings = {
   defaultProvider: ProviderCode | null;
-  defaultModel: string | null;
+  defaultModels: Partial<Record<ProviderCode, string>>;
 };
 ```
 
@@ -181,7 +182,7 @@ const session = await pedelec.createSession({
 });
 ```
 
-If no default provider is configured, this rejects with `DEFAULT_PROVIDER_NOT_SET`. If the default provider is configured but unavailable, it rejects with `DEFAULT_PROVIDER_UNAVAILABLE`.
+If no default provider is configured, this rejects with `DEFAULT_PROVIDER_NOT_SET`. If the default provider is configured but unavailable, it rejects with `DEFAULT_PROVIDER_UNAVAILABLE`. If the default provider has its own default model, the SDK sends that model with the session request.
 
 Use an explicit provider:
 
@@ -191,7 +192,7 @@ const session = await pedelec.createSession({
 });
 ```
 
-When only `provider` is passed, the SDK uses the Desktop App default model only if the default provider matches that provider.
+When only `provider` is passed, the SDK uses that provider's own Desktop App default model if one is configured. Otherwise, it sends the provider without a model and lets the provider CLI use its own default behavior.
 
 Use an explicit provider and model:
 

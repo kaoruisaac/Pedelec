@@ -484,13 +484,15 @@ mod tests {
             "type": "update_settings",
             "requestId": "req_update_settings",
             "defaultProvider": "codex",
-            "defaultModel": "gpt-5"
+            "defaultModels": {
+                "codex": "gpt-5"
+            }
         }))
         .unwrap();
         assert_eq!(update.r#type, "update_settings");
         assert_eq!(
             update.payload.unwrap(),
-            json!({ "defaultProvider": "codex", "defaultModel": "gpt-5" })
+            json!({ "defaultProvider": "codex", "defaultModels": { "codex": "gpt-5" } })
         );
     }
 

@@ -1,7 +1,6 @@
 use crate::pedelec_core::{
-    error_codes, CreateThreadInput, EndThreadInput, SendTextInput, SharedCoreRuntime,
+    error_codes, CreateThreadInput, EndThreadInput, PedelecError, SendTextInput, SharedCoreRuntime,
     SubmitToolResultInput, SubscribeThreadInput, ThreadEvent, ToolCallInput, UpdateSettingsInput,
-    PedelecError,
 };
 use encoding_rs::Encoding;
 use serde::{Deserialize, Serialize};
@@ -1081,11 +1080,11 @@ fn core_unavailable_error(_err: io::Error) -> PedelecError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pedelec_core::{
-        CommandSpec, CoreRuntime, CreateThreadOutput, ProviderAdapterState, ProviderCode,
-        SandboxManager, ThreadState, ThreadStatus, ToolRegistry, PedelecSettings,
-    };
     use crate::pedelec_cli::run_tool_cli_with_runtime_file_path;
+    use crate::pedelec_core::{
+        CommandSpec, CoreRuntime, CreateThreadOutput, PedelecSettings, ProviderAdapterState,
+        ProviderCode, SandboxManager, ThreadState, ThreadStatus, ToolRegistry,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::env;
@@ -1350,7 +1349,7 @@ mod tests {
         assert!(initial.ok);
         assert_eq!(
             initial.result.unwrap(),
-            json!({ "defaultProvider": null, "defaultModel": null })
+            json!({ "defaultProvider": null, "defaultModels": {} })
         );
 
         let updated = handle_core_ipc_request(
@@ -1359,7 +1358,10 @@ mod tests {
                 r#type: "update_settings".into(),
                 payload: Some(json!({
                     "defaultProvider": "codex",
-                    "defaultModel": " gpt-5 "
+                    "defaultModels": {
+                        "codex": " gpt-5 ",
+                        "gemini": "gemini-2.5-pro"
+                    }
                 })),
             },
             Arc::clone(&runtime),
@@ -1367,14 +1369,23 @@ mod tests {
         assert!(updated.ok);
         assert_eq!(
             updated.result.unwrap(),
-            json!({ "defaultProvider": "codex", "defaultModel": "gpt-5" })
+            json!({
+                "defaultProvider": "codex",
+                "defaultModels": {
+                    "codex": "gpt-5",
+                    "gemini": "gemini-2.5-pro"
+                }
+            })
         );
 
         assert_eq!(
             runtime.lock().unwrap().get_settings().unwrap(),
             PedelecSettings {
                 default_provider: Some(ProviderCode::Codex),
-                default_model: Some("gpt-5".into()),
+                default_models: HashMap::from([
+                    (ProviderCode::Codex, "gpt-5".into()),
+                    (ProviderCode::Gemini, "gemini-2.5-pro".into()),
+                ]),
             }
         );
     }

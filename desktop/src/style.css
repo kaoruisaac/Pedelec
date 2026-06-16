@@ -86,7 +86,8 @@ pre {
 .app-sidebar-toggle,
 .app-nav-item,
 .settings-secondary-button,
-.settings-primary-button {
+.settings-primary-button,
+.provider-edit-button {
   border: 1px solid #cdd6e0;
   background: #ffffff;
   color: #1f2933;
@@ -199,7 +200,7 @@ pre {
 .provider-option {
   min-width: 0;
   display: grid;
-  grid-template-columns: 18px minmax(160px, 1fr) auto;
+  grid-template-columns: 18px minmax(180px, 1fr) auto auto;
   gap: 10px;
   align-items: center;
   padding: 12px;
@@ -215,6 +216,11 @@ pre {
 
 .provider-option.is-unavailable {
   background: #f7f8fa;
+}
+
+.provider-radio {
+  display: grid;
+  place-items: center;
 }
 
 .provider-main {
@@ -237,6 +243,22 @@ pre {
 
 .provider-error {
   grid-column: 2 / -1;
+}
+
+.provider-edit-button {
+  min-width: 56px;
+  min-height: 32px;
+  padding: 0 10px;
+  justify-self: end;
+}
+
+.provider-edit-button:hover:not(:disabled),
+.provider-edit-button:focus-visible,
+.settings-secondary-button:hover:not(:disabled),
+.settings-secondary-button:focus-visible {
+  border-color: #2f6fed;
+  color: #174ea6;
+  outline: none;
 }
 
 .provider-status {
@@ -265,6 +287,14 @@ pre {
 
 .settings-field span {
   font-weight: 700;
+}
+
+.settings-field em {
+  margin-left: 6px;
+  color: #6b7b8f;
+  font-style: normal;
+  font-weight: 500;
+  font-size: 12px;
 }
 
 .settings-field input {
@@ -320,6 +350,44 @@ pre {
   border-color: #bce4cc;
 }
 
+.settings-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(17, 24, 39, 0.42);
+}
+
+.settings-modal {
+  width: min(460px, 100%);
+  display: grid;
+  gap: 18px;
+  padding: 20px;
+  border: 1px solid #d6dee8;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 22px 60px rgba(20, 31, 43, 0.22);
+}
+
+.settings-modal-header h2 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.settings-modal-header p {
+  margin: 4px 0 0;
+  color: #5f6f82;
+}
+
+.settings-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 @media (max-width: 760px) {
   .app-shell,
   .app-shell.is-sidebar-collapsed {
@@ -352,6 +420,11 @@ pre {
   }
 
   .provider-status {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .provider-edit-button {
     grid-column: 2;
     justify-self: start;
   }

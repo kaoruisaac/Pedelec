@@ -33,7 +33,7 @@ export type ProviderInfo = {
 
 export type PedelecSettings = {
   defaultProvider: ProviderCode | null;
-  defaultModel: string | null;
+  defaultModels: Partial<Record<ProviderCode, string>>;
 };
 
 export type ApprovalStatus = {
@@ -358,7 +358,7 @@ export class Pedelec {
     await this.assertDefaultProviderAvailable(settings.defaultProvider);
     return {
       provider: settings.defaultProvider,
-      model: settings.defaultModel ?? undefined,
+      model: settings.defaultModels[settings.defaultProvider] ?? undefined,
       skillsUrls,
     };
   }
@@ -374,10 +374,7 @@ export class Pedelec {
     const settings = await this.getSettings();
     return {
       provider,
-      model:
-        settings.defaultProvider === provider && settings.defaultModel
-          ? settings.defaultModel
-          : undefined,
+      model: settings.defaultModels[provider] ?? undefined,
       skillsUrls,
     };
   }
@@ -724,7 +721,13 @@ function isSessionEvent(message: PortMessage): message is SessionEvent {
 
 function isSettings(value: unknown): value is PedelecSettings {
   if (!value || typeof value !== "object") return false;
-  const settings = value as Partial<PedelecSettings>;
+  if (Array.isArray(value)) return false;
+  const settings = value as Partial<PedelecSettings> & { defaultModel?: unknown };
+  const defaultModels = settings.defaultModels;
+  if (settings.defaultModel !== undefined) return false;
+  if (!defaultModels || typeof defaultModels !== "object" || Array.isArray(defaultModels)) {
+    return false;
+  }
   return (
     (settings.defaultProvider === null ||
       settings.defaultProvider === "codex" ||
@@ -732,7 +735,9 @@ function isSettings(value: unknown): value is PedelecSettings {
       settings.defaultProvider === "opencode" ||
       settings.defaultProvider === "cursor" ||
       settings.defaultProvider === "claude") &&
-    (settings.defaultModel === null || typeof settings.defaultModel === "string")
+    Object.entries(defaultModels).every(
+      ([provider, model]) => isProviderCode(provider) && typeof model === "string"
+    )
   );
 }
 

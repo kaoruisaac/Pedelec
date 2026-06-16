@@ -149,7 +149,7 @@ const session = await pedelec.createSession({
 });
 ```
 
-This first reads `defaultProvider` and `defaultModel` from the Desktop App. If no default provider is configured, the SDK throws `DEFAULT_PROVIDER_NOT_SET`.
+This first reads `defaultProvider` and `defaultModels` from the Desktop App. If no default provider is configured, the SDK throws `DEFAULT_PROVIDER_NOT_SET`. If the default provider has its own default model, the SDK sends that model with the session request.
 
 ### Specifying Only the Provider
 
@@ -159,7 +159,7 @@ const session = await pedelec.createSession({
 });
 ```
 
-If the Desktop App's default provider is also `codex`, the SDK reuses the default model. Otherwise, it only sends the provider and does not force a model.
+When only `provider` is passed, the SDK uses that provider's own Desktop App default model if one is configured. Otherwise, it sends the provider without a model and lets the provider CLI use its own default behavior.
 
 ---
 
@@ -195,7 +195,8 @@ type ProviderInfo = {
 const settings = await pedelec.getSettings();
 
 console.log(settings.defaultProvider);
-console.log(settings.defaultModel);
+console.log(settings.defaultModels.codex);
+console.log(settings.defaultModels.gemini);
 ```
 
 Return format:
@@ -203,7 +204,7 @@ Return format:
 ```ts
 type PedelecSettings = {
   defaultProvider: "codex" | "gemini" | "opencode" | "cursor" | "claude" | null;
-  defaultModel: string | null;
+  defaultModels: Partial<Record<"codex" | "gemini" | "opencode" | "cursor" | "claude", string>>;
 };
 ```
 

@@ -199,7 +199,7 @@ pub enum ThreadStatus {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderCode {
     Codex,
@@ -223,14 +223,14 @@ pub struct ProviderInfo {
 #[serde(rename_all = "camelCase")]
 pub struct PedelecSettings {
     pub default_provider: Option<ProviderCode>,
-    pub default_model: Option<String>,
+    pub default_models: HashMap<ProviderCode, String>,
 }
 
 impl Default for PedelecSettings {
     fn default() -> Self {
         Self {
             default_provider: None,
-            default_model: None,
+            default_models: HashMap::new(),
         }
     }
 }
@@ -239,7 +239,7 @@ impl Default for PedelecSettings {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsInput {
     pub default_provider: ProviderCode,
-    pub default_model: Option<String>,
+    pub default_models: HashMap<ProviderCode, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2840,14 +2840,22 @@ fn normalize_update_settings(
         ));
     }
 
-    let default_model = input
-        .default_model
-        .map(|model| model.trim().to_string())
-        .filter(|model| !model.is_empty());
+    let default_models = input
+        .default_models
+        .into_iter()
+        .filter_map(|(provider, model)| {
+            let model = model.trim().to_string();
+            if model.is_empty() {
+                None
+            } else {
+                Some((provider, model))
+            }
+        })
+        .collect();
 
     Ok(PedelecSettings {
         default_provider: Some(input.default_provider),
-        default_model,
+        default_models,
     })
 }
 
@@ -4638,7 +4646,7 @@ mod tests {
     }
 
     #[test]
-    fn update_settings_persists_provider_and_trims_empty_model_to_null() {
+    fn update_settings_persists_provider_and_default_models() {
         let temp = tempfile::tempdir().unwrap();
         let provider_path = test_provider_path(temp.path(), "codex");
         let settings_path = temp.path().join("settings.json");
@@ -4651,7 +4659,10 @@ mod tests {
         let saved = runtime
             .update_settings(UpdateSettingsInput {
                 default_provider: ProviderCode::Codex,
-                default_model: Some("   ".into()),
+                default_models: HashMap::from([
+                    (ProviderCode::Codex, "gpt-5".into()),
+                    (ProviderCode::Gemini, "gemini-2.5-pro".into()),
+                ]),
             })
             .unwrap();
 
@@ -4659,10 +4670,39 @@ mod tests {
             saved,
             PedelecSettings {
                 default_provider: Some(ProviderCode::Codex),
-                default_model: None,
+                default_models: HashMap::from([
+                    (ProviderCode::Codex, "gpt-5".into()),
+                    (ProviderCode::Gemini, "gemini-2.5-pro".into()),
+                ]),
             }
         );
         assert_eq!(read_settings_file(&settings_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn update_settings_trims_and_removes_empty_default_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_path = test_provider_path(temp.path(), "codex");
+        let mut runtime = CoreRuntime {
+            settings_file_path: Some(temp.path().join("settings.json")),
+            provider_path_value_override: Some(provider_path),
+            ..CoreRuntime::default()
+        };
+
+        let saved = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Codex,
+                default_models: HashMap::from([
+                    (ProviderCode::Codex, "  gpt-5  ".into()),
+                    (ProviderCode::Gemini, "   ".into()),
+                ]),
+            })
+            .unwrap();
+
+        assert_eq!(
+            saved.default_models,
+            HashMap::from([(ProviderCode::Codex, "gpt-5".into())])
+        );
     }
 
     #[test]
@@ -4677,12 +4717,54 @@ mod tests {
         let err = runtime
             .update_settings(UpdateSettingsInput {
                 default_provider: ProviderCode::Codex,
-                default_model: None,
+                default_models: HashMap::new(),
             })
             .unwrap_err();
 
         assert_eq!(err.code, error_codes::DEFAULT_PROVIDER_UNAVAILABLE);
         assert!(!temp.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn update_settings_allows_unavailable_non_default_provider_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_path = test_provider_path(temp.path(), "codex");
+        let mut runtime = CoreRuntime {
+            settings_file_path: Some(temp.path().join("settings.json")),
+            provider_path_value_override: Some(provider_path),
+            ..CoreRuntime::default()
+        };
+
+        let saved = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Codex,
+                default_models: HashMap::from([
+                    (ProviderCode::Codex, "gpt-5".into()),
+                    (ProviderCode::Gemini, "gemini-2.5-pro".into()),
+                ]),
+            })
+            .unwrap();
+
+        assert_eq!(saved.default_provider, Some(ProviderCode::Codex));
+        assert_eq!(
+            saved.default_models.get(&ProviderCode::Gemini),
+            Some(&"gemini-2.5-pro".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_default_model_settings_shape_is_not_supported() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        fs::write(
+            &settings_path,
+            r#"{"defaultProvider":"codex","defaultModel":"gpt-5"}"#,
+        )
+        .unwrap();
+
+        let err = read_settings_file(&settings_path).unwrap_err();
+
+        assert_eq!(err.code, error_codes::SETTINGS_READ_FAILED);
     }
 
     #[test]

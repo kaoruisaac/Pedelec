@@ -149,7 +149,7 @@ const session = await pedelec.createSession({
 });
 ```
 
-這會先讀取 Desktop App 的 `defaultProvider` 與 `defaultModel`。如果沒有設定 default provider，SDK 會拋出 `DEFAULT_PROVIDER_NOT_SET`。
+這會先讀取 Desktop App 的 `defaultProvider` 與 `defaultModels`。如果沒有設定 default provider，SDK 會拋出 `DEFAULT_PROVIDER_NOT_SET`。如果該 default provider 有自己的 default model，SDK 會在建立 session 時帶上該 model。
 
 ### 只指定 provider
 
@@ -159,7 +159,7 @@ const session = await pedelec.createSession({
 });
 ```
 
-如果 Desktop App 的 default provider 也是 `codex`，SDK 會沿用 default model；如果不是，則只傳 provider，不強制帶 model。
+只傳 `provider` 時，SDK 會使用該 provider 在 Desktop App 中設定的 default model；若該 provider 未設定 model，則只傳 provider，讓 provider CLI 使用自己的預設行為。
 
 ---
 
@@ -195,7 +195,8 @@ type ProviderInfo = {
 const settings = await pedelec.getSettings();
 
 console.log(settings.defaultProvider);
-console.log(settings.defaultModel);
+console.log(settings.defaultModels.codex);
+console.log(settings.defaultModels.gemini);
 ```
 
 回傳格式：
@@ -203,7 +204,7 @@ console.log(settings.defaultModel);
 ```ts
 type PedelecSettings = {
   defaultProvider: "codex" | "gemini" | "opencode" | "cursor" | "claude" | null;
-  defaultModel: string | null;
+  defaultModels: Partial<Record<"codex" | "gemini" | "opencode" | "cursor" | "claude", string>>;
 };
 ```
 

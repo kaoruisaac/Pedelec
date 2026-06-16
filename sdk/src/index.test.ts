@@ -98,7 +98,7 @@ function respondError(pageWindow: MockWindow, request: any, code = "TEST_ERROR")
 function respondSettings(
   pageWindow: MockWindow,
   request: any,
-  settings = { defaultProvider: null, defaultModel: null }
+  settings = { defaultProvider: null, defaultModels: {} }
 ): void {
   respondOk(pageWindow, request, settings);
 }
@@ -328,8 +328,42 @@ describe("Pedelec SDK", () => {
       type: "get_settings",
     });
 
-    respondOk(pageWindow, request, { defaultProvider: "codex", defaultModel: "gpt-5" });
-    await expect(promise).resolves.toEqual({ defaultProvider: "codex", defaultModel: "gpt-5" });
+    respondOk(pageWindow, request, {
+      defaultProvider: "codex",
+      defaultModels: { codex: "gpt-5" },
+    });
+    await expect(promise).resolves.toEqual({
+      defaultProvider: "codex",
+      defaultModels: { codex: "gpt-5" },
+    });
+  });
+
+  it("rejects invalid settings shapes from the extension", async () => {
+    const pedelec = new Pedelec();
+    const legacy = pedelec.getSettings();
+    respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: "codex", defaultModel: "gpt-5" });
+    await expect(legacy).rejects.toMatchObject({ code: "SDK_PROTOCOL_ERROR" });
+
+    const illegalKey = pedelec.getSettings();
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "codex",
+      defaultModels: { ollama: "qwen" },
+    });
+    await expect(illegalKey).rejects.toMatchObject({ code: "SDK_PROTOCOL_ERROR" });
+
+    const nonStringValue = pedelec.getSettings();
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "codex",
+      defaultModels: { codex: 123 },
+    });
+    await expect(nonStringValue).rejects.toMatchObject({ code: "SDK_PROTOCOL_ERROR" });
+
+    const emptyModels = pedelec.getSettings();
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: null,
+      defaultModels: {},
+    });
+    await expect(emptyModels).resolves.toEqual({ defaultProvider: null, defaultModels: {} });
   });
 
   it("creates a session from default provider and model", async () => {
@@ -338,7 +372,10 @@ describe("Pedelec SDK", () => {
 
     const settingsRequest = pageWindow.lastSent();
     expect(settingsRequest).toMatchObject({ type: "get_settings" });
-    respondOk(pageWindow, settingsRequest, { defaultProvider: "codex", defaultModel: "gpt-5" });
+    respondOk(pageWindow, settingsRequest, {
+      defaultProvider: "codex",
+      defaultModels: { codex: "gpt-5" },
+    });
     await nextTick();
 
     const providersRequest = pageWindow.lastSent();
@@ -360,10 +397,13 @@ describe("Pedelec SDK", () => {
     expect(session.model).toBe("gpt-5");
   });
 
-  it("applies default model only when provider matches default provider", async () => {
+  it("applies the selected provider's default model", async () => {
     const pedelec = new Pedelec();
     const codexPromise = pedelec.createSession({ provider: "codex" });
-    respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: "codex", defaultModel: "gpt-5" });
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "codex",
+      defaultModels: { codex: "gpt-5", gemini: "gemini-2.5-pro" },
+    });
     await nextTick();
     const codexCreate = pageWindow.lastSent();
     expect(codexCreate).toMatchObject({
@@ -374,16 +414,37 @@ describe("Pedelec SDK", () => {
     expect((await codexPromise).model).toBe("gpt-5");
 
     const geminiPromise = pedelec.createSession({ provider: "gemini" });
-    respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: "codex", defaultModel: "gpt-5" });
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "codex",
+      defaultModels: { codex: "gpt-5", gemini: "gemini-2.5-pro" },
+    });
     await nextTick();
     const geminiCreate = pageWindow.lastSent();
     expect(geminiCreate).toMatchObject({
       type: "create_session",
+      input: { provider: "gemini", model: "gemini-2.5-pro", skillsUrls: [] },
+    });
+    respondOk(pageWindow, geminiCreate, { sessionId: "thread_gemini_no_default_model" });
+    expect((await geminiPromise).model).toBe("gemini-2.5-pro");
+  });
+
+  it("omits model when the selected provider has no default model", async () => {
+    const pedelec = new Pedelec();
+    const promise = pedelec.createSession({ provider: "gemini" });
+    respondOk(pageWindow, pageWindow.lastSent(), {
+      defaultProvider: "codex",
+      defaultModels: { codex: "gpt-5" },
+    });
+    await nextTick();
+
+    const createRequest = pageWindow.lastSent();
+    expect(createRequest).toMatchObject({
+      type: "create_session",
       input: { provider: "gemini", skillsUrls: [] },
     });
-    expect(geminiCreate.input.model).toBeUndefined();
-    respondOk(pageWindow, geminiCreate, { sessionId: "thread_gemini_no_default_model" });
-    expect((await geminiPromise).model).toBeUndefined();
+    expect(createRequest.input.model).toBeUndefined();
+    respondOk(pageWindow, createRequest, { sessionId: "thread_gemini_no_model" });
+    expect((await promise).model).toBeUndefined();
   });
 
   it("does not overwrite user supplied model with default model", async () => {
@@ -403,11 +464,11 @@ describe("Pedelec SDK", () => {
   it("returns clear errors when default provider is missing or unavailable", async () => {
     const pedelec = new Pedelec();
     const missing = pedelec.createSession();
-    respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: null, defaultModel: null });
+    respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: null, defaultModels: {} });
     await expect(missing).rejects.toMatchObject({ code: "DEFAULT_PROVIDER_NOT_SET" });
 
     const unavailable = pedelec.createSession();
-    respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: "codex", defaultModel: null });
+    respondOk(pageWindow, pageWindow.lastSent(), { defaultProvider: "codex", defaultModels: {} });
     await nextTick();
     respondOk(pageWindow, pageWindow.lastSent(), [
       { name: "Codex", code: "codex", path: null, available: false, error: "missing" },
