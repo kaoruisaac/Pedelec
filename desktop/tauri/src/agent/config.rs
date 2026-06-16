@@ -23,10 +23,6 @@ pub struct AgentConfig {
     pub ollama_timeout_ms: u64,
     pub home: PathBuf,
     pub sandbox: PathBuf,
-    pub web_search_provider: Option<String>,
-    pub web_search_timeout_ms: u64,
-    pub web_search_max_results: usize,
-    pub brave_search_api_key: Option<String>,
     pub pedelec_cli_path: Option<PathBuf>,
     pub core_runtime_file: Option<PathBuf>,
     pub max_transcript_bytes: u64,
@@ -77,10 +73,6 @@ pub fn resolve_config(cli: &CliArgs) -> Result<AgentConfig, AgentError> {
             .or_else(|| env_file_path(&file_env, "PEDELEC_AGENT_HOME"))
             .unwrap_or_else(|| PathBuf::from(".pedelec-agent")),
         sandbox,
-        web_search_provider: get_optional_value(&file_env, "PEDELEC_AGENT_WEB_SEARCH_PROVIDER"),
-        web_search_timeout_ms: get_u64(&file_env, "PEDELEC_AGENT_WEB_SEARCH_TIMEOUT_MS", 30_000)?,
-        web_search_max_results: get_usize(&file_env, "PEDELEC_AGENT_WEB_SEARCH_MAX_RESULTS", 5)?,
-        brave_search_api_key: get_optional_value(&file_env, "BRAVE_SEARCH_API_KEY"),
         pedelec_cli_path: cli
             .pedelec_cli
             .clone()
@@ -142,10 +134,6 @@ fn read_env_file(path: &Path) -> Result<HashMap<String, String>, AgentError> {
 
 fn get_value(file_env: &HashMap<String, String>, key: &str) -> Option<String> {
     env::var(key).ok().or_else(|| file_env.get(key).cloned())
-}
-
-fn get_optional_value(file_env: &HashMap<String, String>, key: &str) -> Option<String> {
-    get_value(file_env, key).filter(|value| !value.trim().is_empty())
 }
 
 fn get_u64(file_env: &HashMap<String, String>, key: &str, default: u64) -> Result<u64, AgentError> {

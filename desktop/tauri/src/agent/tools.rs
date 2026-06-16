@@ -43,22 +43,6 @@ pub fn tool_definitions() -> Value {
         {
             "type": "function",
             "function": {
-                "name": "web.search",
-                "description": "Search the web for current information.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" },
-                        "maxResults": { "type": "integer" }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "pedelec_cli.tool_call",
                 "description": "Call a Pedelec host app tool through pedelec-cli.",
                 "parameters": {
@@ -100,7 +84,6 @@ pub fn execute_tool(
             let (text, truncated) = sandbox.read_text_file(path)?;
             Ok(serde_json::json!({ "path": path, "text": text, "truncated": truncated }))
         }
-        "web.search" => web_search(args, config),
         "pedelec_cli.tool_call" => pedelec_cli_tool_call(args, session_id, config),
         _ => Err(AgentError::with_details(
             "INVALID_ARGUMENT",
@@ -108,99 +91,6 @@ pub fn execute_tool(
             serde_json::json!({ "tool": tool }),
         )),
     }
-}
-
-fn web_search(args: &Value, config: &AgentConfig) -> Result<Value, AgentError> {
-    let provider = config
-        .web_search_provider
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let api_key = config.brave_search_api_key.as_deref().unwrap_or("");
-    if provider != "brave" || api_key.trim().is_empty() {
-        return Err(AgentError::new(
-            "WEB_SEARCH_UNCONFIGURED",
-            "Web search provider or API key is not configured",
-        ));
-    }
-    let query = args
-        .get("query")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| AgentError::new("INVALID_ARGUMENT", "web.search requires query"))?;
-    let max_results = args
-        .get("maxResults")
-        .and_then(Value::as_u64)
-        .unwrap_or(config.web_search_max_results as u64)
-        .min(config.web_search_max_results as u64) as usize;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(config.web_search_timeout_ms))
-        .build()
-        .map_err(|err| {
-            AgentError::with_details(
-                "WEB_SEARCH_FAILED",
-                "Failed to create web search client",
-                serde_json::json!({ "error": err.to_string() }),
-            )
-        })?;
-    let url: String = format!(
-        "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
-        percent_encode_query(query),
-        max_results
-    );
-    let response = client
-        .get(url)
-        .header("Accept", "application/json")
-        .header("X-Subscription-Token", api_key)
-        .send()
-        .map_err(|err| {
-            AgentError::with_details(
-                "WEB_SEARCH_FAILED",
-                "Web search request failed",
-                serde_json::json!({ "error": err.to_string() }),
-            )
-        })?;
-    let status = response.status();
-    let text = response.text().map_err(|err| {
-        AgentError::with_details(
-            "WEB_SEARCH_FAILED",
-            "Failed to read web search response",
-            serde_json::json!({ "error": err.to_string() }),
-        )
-    })?;
-    if !status.is_success() {
-        return Err(AgentError::with_details(
-            "WEB_SEARCH_FAILED",
-            "Web search request returned an error",
-            serde_json::json!({ "status": status.as_u16(), "body": text }),
-        ));
-    }
-    let value = serde_json::from_str::<Value>(&text).map_err(|err| {
-        AgentError::with_details(
-            "WEB_SEARCH_FAILED",
-            "Web search response was invalid JSON",
-            serde_json::json!({ "error": err.to_string() }),
-        )
-    })?;
-    let results = value
-        .pointer("/web/results")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .take(max_results)
-                .map(|item| {
-                    serde_json::json!({
-                        "title": item.get("title").and_then(Value::as_str).unwrap_or(""),
-                        "url": item.get("url").and_then(Value::as_str).unwrap_or(""),
-                        "snippet": item.get("description").and_then(Value::as_str).unwrap_or("")
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Ok(serde_json::json!({ "query": query, "results": results }))
 }
 
 fn pedelec_cli_tool_call(
@@ -317,56 +207,4 @@ fn candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
         values.push(dir.join(format!("{program}.bat")));
     }
     values
-}
-
-fn percent_encode_query(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            b' ' => encoded.push_str("%20"),
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent::config::{AgentConfig, ModelProvider};
-
-    fn config(temp: &Path) -> AgentConfig {
-        AgentConfig {
-            provider: ModelProvider::Ollama,
-            provider_name: "ollama".into(),
-            model: "fake".into(),
-            ollama_base_url: "http://127.0.0.1:1".into(),
-            ollama_timeout_ms: 1000,
-            home: temp.join("home"),
-            sandbox: temp.to_path_buf(),
-            web_search_provider: None,
-            web_search_timeout_ms: 1000,
-            web_search_max_results: 5,
-            brave_search_api_key: None,
-            pedelec_cli_path: None,
-            core_runtime_file: None,
-            max_transcript_bytes: 1024,
-            max_tool_rounds: 8,
-            max_list_files: 200,
-            max_file_bytes: 1024,
-            pedelec_cli_timeout_ms: 1000,
-        }
-    }
-
-    #[test]
-    fn web_search_without_key_is_unconfigured() {
-        let temp = tempfile::tempdir().unwrap();
-        let err =
-            web_search(&serde_json::json!({ "query": "x" }), &config(temp.path())).unwrap_err();
-
-        assert_eq!(err.code, "WEB_SEARCH_UNCONFIGURED");
-    }
 }

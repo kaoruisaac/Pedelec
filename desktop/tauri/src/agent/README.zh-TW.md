@@ -1,6 +1,6 @@
 # pedelec-agent 使用說明
 
-`pedelec-agent` 是 Pedelec 的輕量 Native Provider。它可以獨立從終端機執行，透過 Ollama 呼叫本機模型，並以 read-only 工具讀取指定 sandbox 內的文字檔、查詢網路，或透過 `pedelec-cli` 呼叫 Pedelec host app tools。
+`pedelec-agent` 是 Pedelec 的輕量 Native Provider。它可以獨立從終端機執行，透過 Ollama 呼叫本機模型，並以 read-only 工具讀取指定 sandbox 內的文字檔，或透過 `pedelec-cli` 呼叫 Pedelec host app tools。
 
 MVP 不會修改、刪除、搬移檔案，也不會執行任意 shell command。stdout 永遠只輸出 JSONL。
 
@@ -75,11 +75,6 @@ PEDELEC_AGENT_SANDBOX=.
 PEDELEC_AGENT_MAX_TRANSCRIPT_BYTES=1048576
 PEDELEC_AGENT_MAX_TOOL_ROUNDS=8
 
-PEDELEC_AGENT_WEB_SEARCH_PROVIDER=brave
-PEDELEC_AGENT_WEB_SEARCH_TIMEOUT_MS=30000
-PEDELEC_AGENT_WEB_SEARCH_MAX_RESULTS=5
-BRAVE_SEARCH_API_KEY=
-
 PEDELEC_CLI_PATH=
 PEDELEC_CORE_RUNTIME_FILE=
 PEDELEC_AGENT_PEDELEC_CLI_TIMEOUT_MS=60000
@@ -123,7 +118,7 @@ stdout 每一行都是一個 JSON object：
 錯誤也會用 JSONL 輸出：
 
 ```jsonl
-{"type":"error","error":{"code":"WEB_SEARCH_UNCONFIGURED","message":"Web search provider or API key is not configured"}}
+{"type":"error","error":{"code":"CONFIG_ERROR","message":"Model is required"}}
 ```
 
 ## 範例
@@ -146,15 +141,6 @@ pedelec-agent run code-demo \
   --model qwen2.5-coder:7b
 ```
 
-使用 Brave Search：
-
-```bash
-BRAVE_SEARCH_API_KEY=你的_api_key \
-pedelec-agent run web-demo \
-  "請查詢 Ollama tool calling API 的最新文件並整理重點" \
-  --sandbox .
-```
-
 透過 `pedelec-cli` 呼叫 host app tool：
 
 ```bash
@@ -172,5 +158,4 @@ pedelec-agent run host-tool-demo \
 - 不支援 stdin prompt。
 - 不會修改檔案。
 - 不會讀取 sandbox 以外的路徑。
-- web search 目前只支援 Brave Search。
 - `pedelec_cli.tool_call` 只會執行 `pedelec-cli tool-call`，不開放任意 shell。
