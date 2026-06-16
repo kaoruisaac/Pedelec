@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliArgs {
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub prompt: String,
     pub sandbox: Option<PathBuf>,
     pub provider: Option<String>,
@@ -19,10 +19,8 @@ pub fn parse_args(args: Vec<String>) -> Result<CliArgs, AgentError> {
         rest.remove(0);
     }
 
-    let session_id = take_positional(&mut rest, "session_id")?;
     let prompt = take_positional(&mut rest, "prompt")?;
     let mut parsed = CliArgs {
-        session_id,
         prompt,
         ..CliArgs::default()
     };
@@ -43,6 +41,10 @@ pub fn parse_args(args: Vec<String>) -> Result<CliArgs, AgentError> {
             }
             "--model" => {
                 parsed.model = Some(take_option_value(&rest, index)?);
+                index += 2;
+            }
+            "--session-id" => {
+                parsed.session_id = Some(take_non_empty_option_value(&rest, index)?);
                 index += 2;
             }
             "--env-file" => {
@@ -92,6 +94,17 @@ fn take_option_value(rest: &[String], index: usize) -> Result<String, AgentError
         })
 }
 
+fn take_non_empty_option_value(rest: &[String], index: usize) -> Result<String, AgentError> {
+    let value = take_option_value(rest, index)?;
+    if value.trim().is_empty() {
+        return Err(AgentError::new(
+            "INVALID_ARGUMENT",
+            format!("Missing value for {}", rest[index]),
+        ));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,14 +114,13 @@ mod tests {
         let args = parse_args(vec![
             "pedelec-agent".into(),
             "run".into(),
-            "s1".into(),
             "hello".into(),
             "--provider".into(),
             "ollama".into(),
         ])
         .unwrap();
 
-        assert_eq!(args.session_id, "s1");
+        assert_eq!(args.session_id, None);
         assert_eq!(args.prompt, "hello");
         assert_eq!(args.provider.as_deref(), Some("ollama"));
     }
@@ -117,13 +129,57 @@ mod tests {
     fn parses_shorthand_command() {
         let args = parse_args(vec![
             "pedelec-agent".into(),
-            "s1".into(),
             "hello".into(),
             "--jsonl".into(),
         ])
         .unwrap();
 
-        assert_eq!(args.session_id, "s1");
+        assert_eq!(args.session_id, None);
         assert_eq!(args.prompt, "hello");
+    }
+
+    #[test]
+    fn parses_session_id_option_for_resume() {
+        let args = parse_args(vec![
+            "pedelec-agent".into(),
+            "run".into(),
+            "hello".into(),
+            "--session-id".into(),
+            "0197d8f0-8e3c-7b1a-a331-3fcf7b1f9176".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.session_id.as_deref(),
+            Some("0197d8f0-8e3c-7b1a-a331-3fcf7b1f9176")
+        );
+        assert_eq!(args.prompt, "hello");
+    }
+
+    #[test]
+    fn rejects_old_positional_session_id_format() {
+        let err = parse_args(vec![
+            "pedelec-agent".into(),
+            "run".into(),
+            "s1".into(),
+            "hello".into(),
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn rejects_empty_session_id_option() {
+        let err = parse_args(vec![
+            "pedelec-agent".into(),
+            "run".into(),
+            "hello".into(),
+            "--session-id".into(),
+            "".into(),
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_ARGUMENT");
     }
 }

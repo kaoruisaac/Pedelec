@@ -5,10 +5,12 @@ use super::jsonl::{AgentEvent, JsonlWriter};
 use super::model::{adapter_for, ModelMessage, ModelToolCall};
 use super::sandbox::Sandbox;
 use super::session::{
-    append_transcript, load_or_create_session, load_transcript, touch_session, TranscriptMessage,
+    append_transcript, create_session, create_session_at, load_session, load_session_at,
+    load_transcript, touch_session, TranscriptMessage,
 };
 use super::tools::{execute_tool, tool_definitions};
 use serde_json::Value;
+use std::path::Path;
 
 const SYSTEM_PROMPT: &str = "You are pedelec-agent, a lightweight read-only assistant.\n\n\
 You can:\n\
@@ -39,6 +41,13 @@ pub fn run() -> i32 {
 }
 
 fn run_inner(args: Vec<String>) -> Result<(), AgentError> {
+    run_inner_with_session_root(args, None)
+}
+
+fn run_inner_with_session_root(
+    args: Vec<String>,
+    session_root: Option<&Path>,
+) -> Result<(), AgentError> {
     let cli = parse_args(args)?;
     let config = resolve_config(&cli)?;
     let sandbox = Sandbox::new(
@@ -46,7 +55,14 @@ fn run_inner(args: Vec<String>) -> Result<(), AgentError> {
         config.max_file_bytes,
         config.max_list_files,
     )?;
-    let mut session = load_or_create_session(&cli.session_id, &config, sandbox.root())?;
+    let mut session = match (cli.session_id.as_deref(), session_root) {
+        (Some(session_id), Some(root)) => {
+            load_session_at(root, session_id, &config, sandbox.root())?
+        }
+        (Some(session_id), None) => load_session(session_id, &config, sandbox.root())?,
+        (None, Some(root)) => create_session_at(root, &config, sandbox.root())?,
+        (None, None) => create_session(&config, sandbox.root())?,
+    };
     let writer = JsonlWriter::new(session.events_path.clone());
     writer.emit(&AgentEvent::Session {
         session_id: session.metadata.session_id.clone(),
@@ -203,7 +219,6 @@ mod tests {
         let code = run_inner(vec![
             "pedelec-agent".into(),
             "run".into(),
-            "s".into(),
             "hello".into(),
             "--env-file".into(),
             temp.path()
@@ -223,35 +238,46 @@ mod tests {
         let env_file = temp.path().join(".env.local");
         std::fs::write(
             &env_file,
-            format!(
-                "PEDELEC_AGENT_MODEL=fake\nOLLAMA_BASE_URL={base_url}\nPEDELEC_AGENT_HOME={}\n",
-                temp.path().join(".pedelec-agent").to_string_lossy()
-            ),
+            format!("PEDELEC_AGENT_MODEL=fake\nOLLAMA_BASE_URL={base_url}\n"),
         )
         .unwrap();
 
-        run_inner(vec![
-            "pedelec-agent".into(),
-            "run".into(),
-            "s1".into(),
-            "read".into(),
-            "--sandbox".into(),
-            temp.path().to_string_lossy().to_string(),
-            "--env-file".into(),
-            env_file.to_string_lossy().to_string(),
-        ])
+        let agent_home = temp.path().join("agent-home");
+        run_inner_with_session_root(
+            vec![
+                "pedelec-agent".into(),
+                "run".into(),
+                "read".into(),
+                "--sandbox".into(),
+                temp.path().to_string_lossy().to_string(),
+                "--env-file".into(),
+                env_file.to_string_lossy().to_string(),
+            ],
+            Some(&agent_home),
+        )
         .unwrap();
         handle.join().unwrap();
 
-        assert!(temp
-            .path()
-            .join(".pedelec-agent/sessions/s1/session.json")
-            .exists());
-        let transcript = std::fs::read_to_string(
-            temp.path()
-                .join(".pedelec-agent/sessions/s1/transcript.jsonl"),
-        )
-        .unwrap();
+        let sessions_root = agent_home.join("sessions");
+        let year_dir = std::fs::read_dir(&sessions_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let month_dir = std::fs::read_dir(year_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let session_dir = std::fs::read_dir(month_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let transcript = std::fs::read_to_string(session_dir.join("transcript.jsonl")).unwrap();
         assert!(transcript.contains("hello readme"));
         assert!(transcript.contains("final answer"));
     }

@@ -21,7 +21,6 @@ pub struct AgentConfig {
     pub model: String,
     pub ollama_base_url: String,
     pub ollama_timeout_ms: u64,
-    pub home: PathBuf,
     pub sandbox: PathBuf,
     pub pedelec_cli_path: Option<PathBuf>,
     pub core_runtime_file: Option<PathBuf>,
@@ -69,9 +68,6 @@ pub fn resolve_config(cli: &CliArgs) -> Result<AgentConfig, AgentError> {
         ollama_base_url: get_value(&file_env, "OLLAMA_BASE_URL")
             .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.into()),
         ollama_timeout_ms: get_u64(&file_env, "OLLAMA_TIMEOUT_MS", 120_000)?,
-        home: env_path("PEDELEC_AGENT_HOME")
-            .or_else(|| env_file_path(&file_env, "PEDELEC_AGENT_HOME"))
-            .unwrap_or_else(|| PathBuf::from(".pedelec-agent")),
         sandbox,
         pedelec_cli_path: cli
             .pedelec_cli
@@ -184,7 +180,7 @@ mod tests {
         )
         .unwrap();
         let cli = CliArgs {
-            session_id: "s".into(),
+            session_id: None,
             prompt: "p".into(),
             model: Some("cli-model".into()),
             env_file: Some(env_file),

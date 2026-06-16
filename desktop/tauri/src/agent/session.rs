@@ -1,11 +1,14 @@
 use super::config::AgentConfig;
 use super::error::AgentError;
 use super::jsonl::append_jsonl;
-use chrono::{DateTime, Utc};
+use crate::pedelec_paths::pedelec_home_dir;
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs;
+use std::fs::{self, DirBuilder};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use uuid::{Uuid, Version};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -36,53 +39,171 @@ pub struct TranscriptMessage {
     pub content: Value,
 }
 
-pub fn load_or_create_session(
+pub fn create_session(
+    config: &AgentConfig,
+    sandbox_path: &Path,
+) -> Result<SessionState, AgentError> {
+    let agent_home = agent_home_dir()?;
+    create_session_at(&agent_home, config, sandbox_path)
+}
+
+pub fn load_session(
     session_id: &str,
     config: &AgentConfig,
     sandbox_path: &Path,
 ) -> Result<SessionState, AgentError> {
-    validate_session_id(session_id)?;
-    let session_dir = config.home.join("sessions").join(session_id);
+    let agent_home = agent_home_dir()?;
+    load_session_at(&agent_home, session_id, config, sandbox_path)
+}
+
+fn agent_home_dir() -> Result<PathBuf, AgentError> {
+    pedelec_home_dir()
+        .map(|home| home.join("pedelec-agent"))
+        .map_err(|err| AgentError {
+            code: err.code,
+            message: err.message,
+            details: err.details,
+        })
+}
+
+pub(crate) fn create_session_at(
+    agent_home: &Path,
+    config: &AgentConfig,
+    sandbox_path: &Path,
+) -> Result<SessionState, AgentError> {
+    for _ in 0..16 {
+        let uuid = Uuid::now_v7();
+        let session_id = uuid.hyphenated().to_string();
+        let (year, month) = uuid_year_month(&uuid, &session_id)?;
+        let session_dir = session_dir_for_parts(agent_home, year, month, &session_id);
+        match DirBuilder::new().recursive(false).create(&session_dir) {
+            Ok(()) => {
+                return initialize_new_session(session_dir, session_id, config, sandbox_path);
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = session_dir.parent() {
+                    fs::create_dir_all(parent).map_err(|err| {
+                        AgentError::with_details(
+                            "SESSION_SAVE_FAILED",
+                            "Failed to create session parent directory",
+                            serde_json::json!({ "path": parent, "error": err.to_string() }),
+                        )
+                    })?;
+                }
+                match DirBuilder::new().recursive(false).create(&session_dir) {
+                    Ok(()) => {
+                        return initialize_new_session(
+                            session_dir,
+                            session_id,
+                            config,
+                            sandbox_path,
+                        );
+                    }
+                    Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(err) => {
+                        return Err(AgentError::with_details(
+                            "SESSION_SAVE_FAILED",
+                            "Failed to create session directory",
+                            serde_json::json!({ "path": session_dir, "error": err.to_string() }),
+                        ));
+                    }
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(AgentError::with_details(
+                    "SESSION_SAVE_FAILED",
+                    "Failed to create session directory",
+                    serde_json::json!({ "path": session_dir, "error": err.to_string() }),
+                ));
+            }
+        }
+    }
+
+    Err(AgentError::new(
+        "SESSION_SAVE_FAILED",
+        "Failed to allocate a unique session id",
+    ))
+}
+
+pub(crate) fn load_session_at(
+    agent_home: &Path,
+    session_id: &str,
+    config: &AgentConfig,
+    sandbox_path: &Path,
+) -> Result<SessionState, AgentError> {
+    let uuid = parse_uuid_v7(session_id)?;
+    let (year, month) = uuid_year_month(&uuid, session_id)?;
+    let session_dir = session_dir_for_parts(agent_home, year, month, session_id);
     let session_path = session_dir.join("session.json");
     let transcript_path = session_dir.join("transcript.jsonl");
     let events_path = session_dir.join("events.jsonl");
 
-    if session_path.exists() {
-        let content = fs::read_to_string(&session_path).map_err(|err| {
-            AgentError::with_details(
-                "SESSION_LOAD_FAILED",
-                "Failed to load session metadata",
-                serde_json::json!({ "path": session_path, "error": err.to_string() }),
-            )
-        })?;
-        let metadata = serde_json::from_str::<SessionMetadata>(&content).map_err(|err| {
-            AgentError::with_details(
-                "SESSION_LOAD_FAILED",
-                "Failed to parse session metadata",
-                serde_json::json!({ "path": session_path, "error": err.to_string() }),
-            )
-        })?;
-        reject_resume_conflicts(&metadata, config, sandbox_path)?;
-        enforce_transcript_size(&transcript_path, config.max_transcript_bytes)?;
-        return Ok(SessionState {
-            metadata,
-            resumed: true,
-            dir: session_dir,
-            transcript_path,
-            events_path,
-        });
+    if !session_dir.exists() || !session_path.exists() {
+        return Err(AgentError::with_details(
+            "SESSION_LOAD_FAILED",
+            "Session was not found",
+            serde_json::json!({ "sessionId": session_id, "path": session_dir }),
+        ));
     }
 
-    fs::create_dir_all(&session_dir).map_err(|err| {
+    let content = fs::read_to_string(&session_path).map_err(|err| {
         AgentError::with_details(
-            "SESSION_SAVE_FAILED",
-            "Failed to create session directory",
-            serde_json::json!({ "path": session_dir, "error": err.to_string() }),
+            "SESSION_LOAD_FAILED",
+            "Failed to load session metadata",
+            serde_json::json!({
+                "sessionId": session_id,
+                "path": session_path,
+                "error": err.to_string()
+            }),
         )
     })?;
+    let metadata = serde_json::from_str::<SessionMetadata>(&content).map_err(|err| {
+        AgentError::with_details(
+            "SESSION_LOAD_FAILED",
+            "Failed to parse session metadata",
+            serde_json::json!({
+                "sessionId": session_id,
+                "path": session_path,
+                "error": err.to_string()
+            }),
+        )
+    })?;
+    if metadata.session_id != session_id {
+        return Err(AgentError::with_details(
+            "SESSION_LOAD_FAILED",
+            "Session metadata id does not match requested session id",
+            serde_json::json!({
+                "sessionId": session_id,
+                "path": session_path,
+                "metadataSessionId": metadata.session_id
+            }),
+        ));
+    }
+    reject_resume_conflicts(&metadata, config, sandbox_path)?;
+    enforce_transcript_size(&transcript_path, config.max_transcript_bytes)?;
+
+    Ok(SessionState {
+        metadata,
+        resumed: true,
+        dir: session_dir,
+        transcript_path,
+        events_path,
+    })
+}
+
+fn initialize_new_session(
+    session_dir: PathBuf,
+    session_id: String,
+    config: &AgentConfig,
+    sandbox_path: &Path,
+) -> Result<SessionState, AgentError> {
+    let session_path = session_dir.join("session.json");
+    let transcript_path = session_dir.join("transcript.jsonl");
+    let events_path = session_dir.join("events.jsonl");
     let now = Utc::now();
     let metadata = SessionMetadata {
-        session_id: session_id.into(),
+        session_id,
         provider: config.provider_name.clone(),
         model: config.model.clone(),
         sandbox_path: sandbox_path.to_path_buf(),
@@ -213,19 +334,52 @@ fn enforce_transcript_size(path: &Path, max_bytes: u64) -> Result<(), AgentError
     Ok(())
 }
 
-fn validate_session_id(session_id: &str) -> Result<(), AgentError> {
-    if session_id.trim().is_empty()
-        || session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-    {
-        return Err(AgentError::with_details(
+fn parse_uuid_v7(session_id: &str) -> Result<Uuid, AgentError> {
+    let uuid = Uuid::parse_str(session_id).map_err(|err| {
+        AgentError::with_details(
             "INVALID_ARGUMENT",
             "Invalid session id",
+            serde_json::json!({ "sessionId": session_id, "error": err.to_string() }),
+        )
+    })?;
+    if uuid.get_version() != Some(Version::SortRand) {
+        return Err(AgentError::with_details(
+            "INVALID_ARGUMENT",
+            "Session id must be a UUID v7",
             serde_json::json!({ "sessionId": session_id }),
         ));
     }
-    Ok(())
+    Ok(uuid)
+}
+
+fn uuid_year_month(uuid: &Uuid, session_id: &str) -> Result<(i32, u32), AgentError> {
+    let timestamp = uuid.get_timestamp().ok_or_else(|| {
+        AgentError::with_details(
+            "INVALID_ARGUMENT",
+            "Session id does not contain a UUID v7 timestamp",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+    })?;
+    let (seconds, nanos) = timestamp.to_unix();
+    let datetime = Utc
+        .timestamp_opt(seconds as i64, nanos)
+        .single()
+        .ok_or_else(|| {
+            AgentError::with_details(
+                "INVALID_ARGUMENT",
+                "Session id timestamp is out of range",
+                serde_json::json!({ "sessionId": session_id }),
+            )
+        })?;
+    Ok((datetime.year(), datetime.month()))
+}
+
+fn session_dir_for_parts(agent_home: &Path, year: i32, month: u32, session_id: &str) -> PathBuf {
+    agent_home
+        .join("sessions")
+        .join(format!("{year:04}"))
+        .join(format!("{month:02}"))
+        .join(session_id)
 }
 
 #[cfg(test)]
@@ -233,14 +387,13 @@ mod tests {
     use super::*;
     use crate::agent::config::{AgentConfig, ModelProvider};
 
-    fn config(home: PathBuf, sandbox: PathBuf) -> AgentConfig {
+    fn config(sandbox: PathBuf) -> AgentConfig {
         AgentConfig {
             provider: ModelProvider::Ollama,
             provider_name: "ollama".into(),
             model: "fake".into(),
             ollama_base_url: "http://127.0.0.1:1".into(),
             ollama_timeout_ms: 1000,
-            home,
             sandbox,
             pedelec_cli_path: None,
             core_runtime_file: None,
@@ -256,26 +409,102 @@ mod tests {
     fn creates_and_resumes_session() {
         let temp = tempfile::tempdir().unwrap();
         let sandbox = temp.path().canonicalize().unwrap();
-        let cfg = config(temp.path().join("home"), sandbox.clone());
+        let cfg = config(sandbox.clone());
+        let home = temp.path().join("home");
 
-        let first = load_or_create_session("s1", &cfg, &sandbox).unwrap();
-        let second = load_or_create_session("s1", &cfg, &sandbox).unwrap();
+        let first = create_session_at(&home, &cfg, &sandbox).unwrap();
+        let second = load_session_at(&home, &first.metadata.session_id, &cfg, &sandbox).unwrap();
 
         assert!(!first.resumed);
         assert!(second.resumed);
+        assert_eq!(first.metadata.session_id, second.metadata.session_id);
     }
 
     #[test]
     fn rejects_conflicting_sandbox() {
         let temp = tempfile::tempdir().unwrap();
         let sandbox = temp.path().canonicalize().unwrap();
-        let cfg = config(temp.path().join("home"), sandbox.clone());
-        load_or_create_session("s1", &cfg, &sandbox).unwrap();
+        let cfg = config(sandbox.clone());
+        let home = temp.path().join("home");
+        let session = create_session_at(&home, &cfg, &sandbox).unwrap();
 
         let other = temp.path().join("other");
         fs::create_dir_all(&other).unwrap();
-        let err = load_or_create_session("s1", &cfg, &other.canonicalize().unwrap()).unwrap_err();
+        let err = load_session_at(
+            &home,
+            &session.metadata.session_id,
+            &cfg,
+            &other.canonicalize().unwrap(),
+        )
+        .unwrap_err();
 
         assert_eq!(err.code, "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn create_session_generates_uuid_v7_and_layered_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().canonicalize().unwrap();
+        let cfg = config(sandbox.clone());
+        let home = temp.path().join("home");
+
+        let first = create_session_at(&home, &cfg, &sandbox).unwrap();
+        let second = create_session_at(&home, &cfg, &sandbox).unwrap();
+        let uuid = Uuid::parse_str(&first.metadata.session_id).unwrap();
+        let (year, month) = uuid_year_month(&uuid, &first.metadata.session_id).unwrap();
+
+        assert_eq!(uuid.get_version(), Some(Version::SortRand));
+        assert_eq!(first.metadata.session_id, uuid.hyphenated().to_string());
+        assert_ne!(first.metadata.session_id, second.metadata.session_id);
+        assert_eq!(
+            first.dir,
+            home.join("sessions")
+                .join(format!("{year:04}"))
+                .join(format!("{month:02}"))
+                .join(&first.metadata.session_id)
+        );
+        assert_eq!(
+            fs::read_to_string(first.dir.join("session.json"))
+                .unwrap()
+                .contains(&first.metadata.session_id),
+            true
+        );
+    }
+
+    #[test]
+    fn load_session_rejects_uuid_v4_and_missing_v7_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().canonicalize().unwrap();
+        let cfg = config(sandbox.clone());
+        let home = temp.path().join("home");
+
+        let err = load_session_at(
+            &home,
+            "123e4567-e89b-42d3-a456-426614174000",
+            &cfg,
+            &sandbox,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "INVALID_ARGUMENT");
+
+        let missing = Uuid::now_v7().hyphenated().to_string();
+        let err = load_session_at(&home, &missing, &cfg, &sandbox).unwrap_err();
+        assert_eq!(err.code, "SESSION_LOAD_FAILED");
+    }
+
+    #[test]
+    fn load_session_rejects_metadata_session_id_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().canonicalize().unwrap();
+        let cfg = config(sandbox.clone());
+        let home = temp.path().join("home");
+        let session = create_session_at(&home, &cfg, &sandbox).unwrap();
+        let mut metadata = session.metadata.clone();
+        metadata.session_id = Uuid::now_v7().hyphenated().to_string();
+        save_session_metadata(&session.dir.join("session.json"), &metadata).unwrap();
+
+        let err = load_session_at(&home, &session.metadata.session_id, &cfg, &sandbox).unwrap_err();
+
+        assert_eq!(err.code, "SESSION_LOAD_FAILED");
     }
 }
