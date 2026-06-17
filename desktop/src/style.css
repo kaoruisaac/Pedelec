@@ -355,19 +355,8 @@ pre {
   border-color: #bce4cc;
 }
 
-.settings-modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  background: rgba(17, 24, 39, 0.42);
-}
-
 .settings-modal {
-  width: min(460px, 100%);
-  max-height: min(680px, calc(100vh - 40px));
+  width: 460px;
   overflow: auto;
   display: grid;
   gap: 18px;
