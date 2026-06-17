@@ -15,6 +15,8 @@ use url::Url;
 
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_SKILL_SIZE_BYTES: u64 = 1024 * 1024;
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+pub const DEFAULT_OLLAMA_TIMEOUT_MS: u64 = 120_000;
 const SANDBOX_SUBDIRS: [&str; 5] = ["skills", "input", "output", "logs", "tmp"];
 const TOOL_TIMEOUT_OVERRIDE_FIELD: &str = "timeoutMs";
 const THREAD_ID_BASE36_MIN_WIDTH: usize = 6;
@@ -225,6 +227,7 @@ pub struct ProviderInfo {
 pub struct PedelecSettings {
     pub default_provider: Option<ProviderCode>,
     pub default_models: HashMap<ProviderCode, String>,
+    pub provider_settings: ProviderSettings,
 }
 
 impl Default for PedelecSettings {
@@ -232,6 +235,7 @@ impl Default for PedelecSettings {
         Self {
             default_provider: None,
             default_models: HashMap::new(),
+            provider_settings: ProviderSettings::default(),
         }
     }
 }
@@ -241,6 +245,75 @@ impl Default for PedelecSettings {
 pub struct UpdateSettingsInput {
     pub default_provider: ProviderCode,
     pub default_models: HashMap<ProviderCode, String>,
+    pub provider_settings: ProviderSettingsInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSettings {
+    pub ollama: OllamaProviderSettings,
+}
+
+impl Default for ProviderSettings {
+    fn default() -> Self {
+        Self {
+            ollama: OllamaProviderSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaProviderSettings {
+    pub base_url: String,
+    pub timeout_ms: u64,
+}
+
+impl Default for OllamaProviderSettings {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
+            timeout_ms: DEFAULT_OLLAMA_TIMEOUT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSettingsInput {
+    pub ollama: OllamaProviderSettingsInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaProviderSettingsInput {
+    pub base_url: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl Default for ProviderSettingsInput {
+    fn default() -> Self {
+        Self {
+            ollama: OllamaProviderSettingsInput {
+                base_url: Some(DEFAULT_OLLAMA_BASE_URL.to_string()),
+                timeout_ms: Some(DEFAULT_OLLAMA_TIMEOUT_MS),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ListOllamaModelsInput {
+    pub base_url: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaModelOption {
+    pub value: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1241,6 +1314,13 @@ impl CoreRuntime {
         let settings = normalize_update_settings(input, path_value.as_ref())?;
         write_settings_file(&self.resolved_settings_file_path()?, &settings)?;
         Ok(settings)
+    }
+
+    pub fn list_ollama_models(
+        &self,
+        input: ListOllamaModelsInput,
+    ) -> Result<Vec<OllamaModelOption>, PedelecError> {
+        list_ollama_models(input)
     }
 
     fn provider_path_value(&self) -> Option<OsString> {
@@ -2866,6 +2946,11 @@ pub mod error_codes {
     pub const MODEL_REQUIRED: &str = "MODEL_REQUIRED";
     pub const SETTINGS_READ_FAILED: &str = "SETTINGS_READ_FAILED";
     pub const SETTINGS_WRITE_FAILED: &str = "SETTINGS_WRITE_FAILED";
+    pub const OLLAMA_SETTINGS_INVALID: &str = "OLLAMA_SETTINGS_INVALID";
+    pub const OLLAMA_MODELS_REQUEST_FAILED: &str = "OLLAMA_MODELS_REQUEST_FAILED";
+    pub const OLLAMA_MODELS_TIMEOUT: &str = "OLLAMA_MODELS_TIMEOUT";
+    pub const OLLAMA_MODELS_UNAVAILABLE: &str = "OLLAMA_MODELS_UNAVAILABLE";
+    pub const OLLAMA_MODELS_RESPONSE_INVALID: &str = "OLLAMA_MODELS_RESPONSE_INVALID";
 }
 
 fn provider_code_as_str(provider: &ProviderCode) -> &'static str {
@@ -2967,7 +3052,160 @@ fn normalize_update_settings(
     Ok(PedelecSettings {
         default_provider: Some(input.default_provider),
         default_models,
+        provider_settings: normalize_provider_settings(input.provider_settings)?,
     })
+}
+
+fn normalize_provider_settings(
+    settings: ProviderSettingsInput,
+) -> Result<ProviderSettings, PedelecError> {
+    Ok(ProviderSettings {
+        ollama: normalize_ollama_provider_settings(settings.ollama)?,
+    })
+}
+
+fn normalize_ollama_provider_settings(
+    settings: OllamaProviderSettingsInput,
+) -> Result<OllamaProviderSettings, PedelecError> {
+    Ok(OllamaProviderSettings {
+        base_url: normalize_ollama_base_url(settings.base_url)?,
+        timeout_ms: validate_ollama_timeout(
+            settings.timeout_ms.unwrap_or(DEFAULT_OLLAMA_TIMEOUT_MS),
+        )?,
+    })
+}
+
+pub fn normalize_ollama_base_url(value: Option<String>) -> Result<String, PedelecError> {
+    let trimmed = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_OLLAMA_BASE_URL);
+    validate_ollama_base_url(trimmed)
+}
+
+pub fn validate_ollama_base_url(value: &str) -> Result<String, PedelecError> {
+    let trimmed = value.trim();
+    let parsed = Url::parse(trimmed).map_err(|err| {
+        PedelecError::with_details(
+            error_codes::OLLAMA_SETTINGS_INVALID,
+            "Ollama Base URL must be an absolute http:// or https:// URL.",
+            serde_json::json!({ "field": "baseUrl", "value": value, "error": err.to_string() }),
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || !parsed.has_host() {
+        return Err(PedelecError::with_details(
+            error_codes::OLLAMA_SETTINGS_INVALID,
+            "Ollama Base URL must be an absolute http:// or https:// URL.",
+            serde_json::json!({ "field": "baseUrl", "value": value }),
+        ));
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+pub fn validate_ollama_timeout(value: u64) -> Result<u64, PedelecError> {
+    if value == 0 {
+        return Err(PedelecError::with_details(
+            error_codes::OLLAMA_SETTINGS_INVALID,
+            "Ollama timeout must be greater than 0 milliseconds.",
+            serde_json::json!({ "field": "timeoutMs", "value": value }),
+        ));
+    }
+    Ok(value)
+}
+
+fn list_ollama_models(
+    input: ListOllamaModelsInput,
+) -> Result<Vec<OllamaModelOption>, PedelecError> {
+    let base_url = normalize_ollama_base_url(input.base_url)?;
+    let timeout_ms =
+        validate_ollama_timeout(input.timeout_ms.unwrap_or(DEFAULT_OLLAMA_TIMEOUT_MS))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .map_err(|err| {
+            PedelecError::with_details(
+                error_codes::OLLAMA_MODELS_REQUEST_FAILED,
+                "Cannot create Ollama model list client.",
+                serde_json::json!({ "error": err.to_string(), "timeoutMs": timeout_ms }),
+            )
+        })?;
+    let url = format!("{base_url}/api/tags");
+    let response = client.get(&url).send().map_err(|err| {
+        let code = if err.is_timeout() {
+            error_codes::OLLAMA_MODELS_TIMEOUT
+        } else if err.is_connect() {
+            error_codes::OLLAMA_MODELS_UNAVAILABLE
+        } else {
+            error_codes::OLLAMA_MODELS_REQUEST_FAILED
+        };
+        PedelecError::with_details(
+            code,
+            if err.is_timeout() {
+                "Ollama model list request timed out."
+            } else if err.is_connect() {
+                "Cannot connect to Ollama."
+            } else {
+                "Ollama model list request failed."
+            },
+            serde_json::json!({ "url": url, "timeoutMs": timeout_ms, "error": err.to_string() }),
+        )
+    })?;
+    let status = response.status();
+    let text = response.text().map_err(|err| {
+        PedelecError::with_details(
+            error_codes::OLLAMA_MODELS_REQUEST_FAILED,
+            "Cannot read Ollama model list response.",
+            serde_json::json!({ "url": url, "error": err.to_string() }),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(PedelecError::with_details(
+            error_codes::OLLAMA_MODELS_REQUEST_FAILED,
+            "Ollama returned a non-success status while listing models.",
+            serde_json::json!({ "url": url, "status": status.as_u16(), "body": text }),
+        ));
+    }
+    parse_ollama_models_response(&text)
+}
+
+fn parse_ollama_models_response(text: &str) -> Result<Vec<OllamaModelOption>, PedelecError> {
+    let value = serde_json::from_str::<Value>(text).map_err(|err| {
+        PedelecError::with_details(
+            error_codes::OLLAMA_MODELS_RESPONSE_INVALID,
+            "Ollama model list response was not valid JSON.",
+            serde_json::json!({ "error": err.to_string(), "body": text }),
+        )
+    })?;
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            PedelecError::with_details(
+                error_codes::OLLAMA_MODELS_RESPONSE_INVALID,
+                "Ollama model list response did not include a valid models array.",
+                serde_json::json!({ "body": value }),
+            )
+        })?;
+    Ok(models
+        .iter()
+        .filter_map(|item| {
+            let model = item.get("model")?.as_str()?.trim();
+            if model.is_empty() {
+                return None;
+            }
+            let label = item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(model);
+            Some(OllamaModelOption {
+                value: model.to_string(),
+                label: label.to_string(),
+            })
+        })
+        .collect())
 }
 
 fn default_settings_file_path() -> Result<PathBuf, PedelecError> {
@@ -5122,6 +5360,42 @@ mod tests {
     }
 
     #[test]
+    fn settings_new_json_shape_round_trips() {
+        let settings = PedelecSettings {
+            default_provider: Some(ProviderCode::Ollama),
+            default_models: HashMap::from([(ProviderCode::Ollama, "qwen3:8b".into())]),
+            provider_settings: ProviderSettings {
+                ollama: OllamaProviderSettings {
+                    base_url: "http://127.0.0.1:11434".into(),
+                    timeout_ms: 120_000,
+                },
+            },
+        };
+
+        let value = serde_json::to_value(&settings).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "defaultProvider": "ollama",
+                "defaultModels": {
+                    "ollama": "qwen3:8b"
+                },
+                "providerSettings": {
+                    "ollama": {
+                        "baseUrl": "http://127.0.0.1:11434",
+                        "timeoutMs": 120000
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<PedelecSettings>(value).unwrap(),
+            settings
+        );
+    }
+
+    #[test]
     fn update_settings_persists_provider_and_default_models() {
         let temp = tempfile::tempdir().unwrap();
         let provider_path = test_provider_path(temp.path(), "pedelec-agent");
@@ -5139,6 +5413,7 @@ mod tests {
                     (ProviderCode::Codex, "gpt-5".into()),
                     (ProviderCode::Ollama, "qwen3-14b-32k:latest".into()),
                 ]),
+                provider_settings: ProviderSettingsInput::default(),
             })
             .unwrap();
 
@@ -5150,9 +5425,110 @@ mod tests {
                     (ProviderCode::Codex, "gpt-5".into()),
                     (ProviderCode::Ollama, "qwen3-14b-32k:latest".into()),
                 ]),
+                provider_settings: ProviderSettings::default(),
             }
         );
         assert_eq!(read_settings_file(&settings_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn update_settings_persists_and_normalizes_ollama_provider_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_path = test_provider_path(temp.path(), "pedelec-agent");
+        let settings_path = temp.path().join("settings.json");
+        let mut runtime = CoreRuntime {
+            settings_file_path: Some(settings_path.clone()),
+            provider_path_value_override: Some(provider_path),
+            ..CoreRuntime::default()
+        };
+
+        let saved = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Ollama,
+                default_models: HashMap::from([(ProviderCode::Ollama, "qwen3:8b".into())]),
+                provider_settings: ProviderSettingsInput {
+                    ollama: OllamaProviderSettingsInput {
+                        base_url: Some(" https://ollama.example.test/ ".into()),
+                        timeout_ms: Some(250_000),
+                    },
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            saved.provider_settings.ollama.base_url,
+            "https://ollama.example.test"
+        );
+        assert_eq!(saved.provider_settings.ollama.timeout_ms, 250_000);
+        assert_eq!(read_settings_file(&settings_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn update_settings_defaults_blank_base_url_and_missing_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_path = test_provider_path(temp.path(), "pedelec-agent");
+        let mut runtime = CoreRuntime {
+            settings_file_path: Some(temp.path().join("settings.json")),
+            provider_path_value_override: Some(provider_path),
+            ..CoreRuntime::default()
+        };
+
+        let saved = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Ollama,
+                default_models: HashMap::new(),
+                provider_settings: ProviderSettingsInput {
+                    ollama: OllamaProviderSettingsInput {
+                        base_url: Some("   ".into()),
+                        timeout_ms: None,
+                    },
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            saved.provider_settings.ollama,
+            OllamaProviderSettings::default()
+        );
+    }
+
+    #[test]
+    fn update_settings_rejects_invalid_ollama_provider_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider_path = test_provider_path(temp.path(), "pedelec-agent");
+        let mut runtime = CoreRuntime {
+            settings_file_path: Some(temp.path().join("settings.json")),
+            provider_path_value_override: Some(provider_path),
+            ..CoreRuntime::default()
+        };
+
+        let invalid_url = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Ollama,
+                default_models: HashMap::new(),
+                provider_settings: ProviderSettingsInput {
+                    ollama: OllamaProviderSettingsInput {
+                        base_url: Some("ftp://127.0.0.1:11434".into()),
+                        timeout_ms: Some(120_000),
+                    },
+                },
+            })
+            .unwrap_err();
+        assert_eq!(invalid_url.code, error_codes::OLLAMA_SETTINGS_INVALID);
+
+        let invalid_timeout = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Ollama,
+                default_models: HashMap::new(),
+                provider_settings: ProviderSettingsInput {
+                    ollama: OllamaProviderSettingsInput {
+                        base_url: Some(DEFAULT_OLLAMA_BASE_URL.into()),
+                        timeout_ms: Some(0),
+                    },
+                },
+            })
+            .unwrap_err();
+        assert_eq!(invalid_timeout.code, error_codes::OLLAMA_SETTINGS_INVALID);
     }
 
     #[test]
@@ -5172,6 +5548,7 @@ mod tests {
                     (ProviderCode::Codex, "  gpt-5  ".into()),
                     (ProviderCode::Gemini, "   ".into()),
                 ]),
+                provider_settings: ProviderSettingsInput::default(),
             })
             .unwrap();
 
@@ -5194,6 +5571,7 @@ mod tests {
             .update_settings(UpdateSettingsInput {
                 default_provider: ProviderCode::Codex,
                 default_models: HashMap::new(),
+                provider_settings: ProviderSettingsInput::default(),
             })
             .unwrap_err();
 
@@ -5218,6 +5596,7 @@ mod tests {
                     (ProviderCode::Codex, "gpt-5".into()),
                     (ProviderCode::Gemini, "gemini-2.5-pro".into()),
                 ]),
+                provider_settings: ProviderSettingsInput::default(),
             })
             .unwrap();
 
@@ -5226,6 +5605,134 @@ mod tests {
             saved.default_models.get(&ProviderCode::Gemini),
             Some(&"gemini-2.5-pro".to_string())
         );
+    }
+
+    #[test]
+    fn list_ollama_models_parses_tags_response() {
+        let (base_url, handle) = start_single_response_server(
+            200,
+            r#"{"models":[{"model":"qwen3:8b","name":"Qwen 3"},{"model":"llama3"},{"model":""},{"name":"missing-model"}]}"#,
+        );
+        let runtime = CoreRuntime::default();
+
+        let models = runtime
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(format!("{base_url}/")),
+                timeout_ms: Some(120_000),
+            })
+            .unwrap();
+        let request = handle.join().unwrap();
+
+        assert!(request.starts_with("GET /api/tags "));
+        assert_eq!(
+            models,
+            vec![
+                OllamaModelOption {
+                    value: "qwen3:8b".into(),
+                    label: "Qwen 3".into(),
+                },
+                OllamaModelOption {
+                    value: "llama3".into(),
+                    label: "llama3".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_ollama_models_allows_empty_model_list() {
+        let (base_url, handle) = start_single_response_server(200, r#"{"models":[]}"#);
+        let models = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(base_url),
+                timeout_ms: Some(120_000),
+            })
+            .unwrap();
+        handle.join().unwrap();
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn list_ollama_models_reports_http_and_invalid_json_errors() {
+        let (base_url, http_handle) = start_single_response_server(500, "nope");
+        let http_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(base_url),
+                timeout_ms: Some(120_000),
+            })
+            .unwrap_err();
+        http_handle.join().unwrap();
+        assert_eq!(http_err.code, error_codes::OLLAMA_MODELS_REQUEST_FAILED);
+
+        let (base_url, json_handle) = start_single_response_server(200, "{not-json");
+        let json_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(base_url),
+                timeout_ms: Some(120_000),
+            })
+            .unwrap_err();
+        json_handle.join().unwrap();
+        assert_eq!(json_err.code, error_codes::OLLAMA_MODELS_RESPONSE_INVALID);
+    }
+
+    #[test]
+    fn list_ollama_models_reports_invalid_shape_and_bad_input() {
+        let (base_url, handle) = start_single_response_server(200, r#"{"models":{}}"#);
+        let shape_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(base_url),
+                timeout_ms: Some(120_000),
+            })
+            .unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(shape_err.code, error_codes::OLLAMA_MODELS_RESPONSE_INVALID);
+
+        let url_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some("not-a-url".into()),
+                timeout_ms: Some(120_000),
+            })
+            .unwrap_err();
+        assert_eq!(url_err.code, error_codes::OLLAMA_SETTINGS_INVALID);
+
+        let timeout_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(DEFAULT_OLLAMA_BASE_URL.into()),
+                timeout_ms: Some(0),
+            })
+            .unwrap_err();
+        assert_eq!(timeout_err.code, error_codes::OLLAMA_SETTINGS_INVALID);
+    }
+
+    #[test]
+    fn list_ollama_models_reports_connection_refused_and_timeout() {
+        let refused_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused_url = format!("http://{}", refused_listener.local_addr().unwrap());
+        drop(refused_listener);
+
+        let refused_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(refused_url),
+                timeout_ms: Some(120_000),
+            })
+            .unwrap_err();
+        assert_eq!(refused_err.code, error_codes::OLLAMA_MODELS_UNAVAILABLE);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let timeout_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+        let timeout_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(timeout_url),
+                timeout_ms: Some(1),
+            })
+            .unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(timeout_err.code, error_codes::OLLAMA_MODELS_TIMEOUT);
     }
 
     #[test]
@@ -6516,6 +7023,31 @@ mod tests {
                         .unwrap();
                 }
             }
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn start_single_response_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 2048];
+            let bytes_read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let reason = if status == 200 { "OK" } else { "Error" };
+            write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request.lines().next().unwrap_or_default().to_string()
         });
 
         (format!("http://{address}"), handle)

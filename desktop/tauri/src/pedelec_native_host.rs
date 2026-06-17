@@ -486,13 +486,28 @@ mod tests {
             "defaultProvider": "codex",
             "defaultModels": {
                 "codex": "gpt-5"
+            },
+            "providerSettings": {
+                "ollama": {
+                    "baseUrl": "http://127.0.0.1:11434",
+                    "timeoutMs": 120000
+                }
             }
         }))
         .unwrap();
         assert_eq!(update.r#type, "update_settings");
         assert_eq!(
             update.payload.unwrap(),
-            json!({ "defaultProvider": "codex", "defaultModels": { "codex": "gpt-5" } })
+            json!({
+                "defaultProvider": "codex",
+                "defaultModels": { "codex": "gpt-5" },
+                "providerSettings": {
+                    "ollama": {
+                        "baseUrl": "http://127.0.0.1:11434",
+                        "timeoutMs": 120000
+                    }
+                }
+            })
         );
     }
 

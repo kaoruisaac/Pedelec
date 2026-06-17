@@ -297,13 +297,18 @@ pre {
   font-size: 12px;
 }
 
-.settings-field input {
+.settings-field input,
+.settings-field select {
   width: 100%;
   min-height: 38px;
   border: 1px solid #cdd6e0;
   border-radius: 6px;
   padding: 8px 10px;
   background: #ffffff;
+}
+
+.settings-field select {
+  appearance: auto;
 }
 
 .settings-actions {
@@ -362,6 +367,8 @@ pre {
 
 .settings-modal {
   width: min(460px, 100%);
+  max-height: min(680px, calc(100vh - 40px));
+  overflow: auto;
   display: grid;
   gap: 18px;
   padding: 20px;
@@ -380,6 +387,23 @@ pre {
 .settings-modal-header p {
   margin: 4px 0 0;
   color: #5f6f82;
+}
+
+.settings-modal-fields {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.settings-modal-status {
+  min-height: 20px;
+  color: #6b7b8f;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.settings-field-error {
+  color: #8f1d1d;
 }
 
 .settings-modal-actions {

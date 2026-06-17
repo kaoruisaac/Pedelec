@@ -11,32 +11,60 @@ interface Provider {
   description?: string;
 }
 
+interface OllamaProviderSettings {
+  baseUrl: string;
+  timeoutMs: number;
+}
+
+interface ProviderSettings {
+  ollama: OllamaProviderSettings;
+}
+
 interface Settings {
   defaultProvider: ProviderCode | null;
   defaultModels: Partial<Record<ProviderCode, string>>;
+  providerSettings: ProviderSettings;
 }
+
+interface OllamaModelOption {
+  value: string;
+  label: string;
+}
+
+const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
+const DEFAULT_OLLAMA_TIMEOUT_MS = 120000;
 
 const emptySettings: Settings = {
   defaultProvider: null,
   defaultModels: {},
+  providerSettings: {
+    ollama: {
+      baseUrl: DEFAULT_OLLAMA_BASE_URL,
+      timeoutMs: DEFAULT_OLLAMA_TIMEOUT_MS,
+    },
+  },
 };
 
 function SettingsPage() {
   const [settings, setSettings] = createSignal<Settings>(emptySettings);
+  const [draftSettings, setDraftSettings] = createSignal<Settings>(emptySettings);
   const [providers, setProviders] = createSignal<Provider[]>([]);
-  const [selectedProvider, setSelectedProvider] = createSignal<ProviderCode | "">("");
-  const [draftDefaultModels, setDraftDefaultModels] = createSignal<
-    Partial<Record<ProviderCode, string>>
-  >({});
   const [editingProvider, setEditingProvider] = createSignal<Provider | null>(null);
+  const [editingBaseUrl, setEditingBaseUrl] = createSignal("");
+  const [editingTimeoutMs, setEditingTimeoutMs] = createSignal("");
   const [editingModel, setEditingModel] = createSignal("");
+  const [ollamaModels, setOllamaModels] = createSignal<OllamaModelOption[]>([]);
+  const [ollamaModelsLoading, setOllamaModelsLoading] = createSignal(false);
+  const [ollamaModelsError, setOllamaModelsError] = createSignal("");
+  const [fieldError, setFieldError] = createSignal("");
   const [loading, setLoading] = createSignal(true);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal("");
   const [savedMessage, setSavedMessage] = createSignal("");
+  let ollamaModelsRequestSeq = 0;
 
   const selectedProviderInfo = createMemo(() =>
-    providers().find((provider) => provider.code === selectedProvider()),
+    providers().find((provider) => provider.code === draftSettings().defaultProvider),
   );
   const savedProviderInfo = createMemo(() =>
     providers().find((provider) => provider.code === settings().defaultProvider),
@@ -45,6 +73,11 @@ function SettingsPage() {
     () => Boolean(settings().defaultProvider) && savedProviderInfo()?.available === false,
   );
   const canSave = createMemo(() => Boolean(selectedProviderInfo()?.available) && !saving());
+  const canApplyOllama = createMemo(() => {
+    if (ollamaModelsLoading() || ollamaModelsError() || fieldError()) return false;
+    if (!editingModel()) return false;
+    return ollamaModels().some((model) => model.value === editingModel());
+  });
 
   onMount(() => {
     loadSettings();
@@ -76,9 +109,8 @@ function SettingsPage() {
       ]);
       const normalizedSettings = normalizeSettings(nextSettings);
       setSettings(normalizedSettings);
+      setDraftSettings(cloneSettings(normalizedSettings));
       setProviders(Array.isArray(nextProviders) ? nextProviders : []);
-      setSelectedProvider(normalizedSettings.defaultProvider || "");
-      setDraftDefaultModels({ ...normalizedSettings.defaultModels });
     } catch (err) {
       setError(formatError(err));
     } finally {
@@ -100,15 +132,14 @@ function SettingsPage() {
     setSaving(true);
     try {
       const nextSettings = await invoke<Settings>("update_settings", {
-        input: {
+        input: cloneSettings({
+          ...draftSettings(),
           defaultProvider: provider.code,
-          defaultModels: { ...draftDefaultModels() },
-        },
+        }),
       });
       const normalizedSettings = normalizeSettings(nextSettings);
       setSettings(normalizedSettings);
-      setSelectedProvider(normalizedSettings.defaultProvider || "");
-      setDraftDefaultModels({ ...normalizedSettings.defaultModels });
+      setDraftSettings(cloneSettings(normalizedSettings));
       setSavedMessage("Settings saved.");
     } catch (err) {
       setError(formatError(err));
@@ -117,15 +148,91 @@ function SettingsPage() {
     }
   }
 
+  function setDraftProvider(provider: ProviderCode): void {
+    setDraftSettings((current) => ({ ...current, defaultProvider: provider }));
+  }
+
   function openEditor(provider: Provider): void {
-    if (!provider.available || loading() || saving()) return;
+    if (!canEditProvider(provider)) return;
+    clearModalState();
     setEditingProvider(provider);
-    setEditingModel(draftDefaultModels()[provider.code] ?? "");
+    setEditingModel(draftSettings().defaultModels[provider.code] ?? "");
+    if (provider.code === "ollama") {
+      const ollama = draftSettings().providerSettings.ollama;
+      setEditingBaseUrl(ollama.baseUrl);
+      setEditingTimeoutMs(String(ollama.timeoutMs));
+      void loadOllamaModels(ollama.baseUrl, String(ollama.timeoutMs), draftSettings().defaultModels.ollama ?? "");
+    }
   }
 
   function closeEditor(): void {
+    ollamaModelsRequestSeq += 1;
     setEditingProvider(null);
+    clearModalState();
+  }
+
+  function clearModalState(): void {
+    setEditingBaseUrl("");
+    setEditingTimeoutMs("");
     setEditingModel("");
+    setOllamaModels([]);
+    setOllamaModelsLoading(false);
+    setOllamaModelsError("");
+    setFieldError("");
+  }
+
+  function canEditProvider(provider: Provider): boolean {
+    if (loading() || saving()) return false;
+    return provider.available || provider.code === "ollama";
+  }
+
+  async function loadOllamaModels(
+    baseUrlValue = editingBaseUrl(),
+    timeoutValue = editingTimeoutMs(),
+    currentModel = editingModel(),
+  ): Promise<void> {
+    const requestSeq = ++ollamaModelsRequestSeq;
+    setFieldError("");
+    setOllamaModelsError("");
+    setOllamaModels([]);
+
+    const timeout = parseOptionalTimeout(timeoutValue);
+    if (!timeout.ok) {
+      setFieldError(timeout.error);
+      return;
+    }
+
+    setOllamaModelsLoading(true);
+    try {
+      const models = await invoke<OllamaModelOption[]>("list_ollama_models", {
+        input: {
+          baseUrl: baseUrlValue,
+          timeoutMs: timeout.value,
+        },
+      });
+      if (!isCurrentOllamaRequest(requestSeq)) return;
+
+      const nextModels = Array.isArray(models) ? models : [];
+      setOllamaModels(nextModels);
+      if (currentModel && nextModels.some((model) => model.value === currentModel)) {
+        setEditingModel(currentModel);
+      } else {
+        setEditingModel("");
+      }
+    } catch (err) {
+      if (!isCurrentOllamaRequest(requestSeq)) return;
+      setOllamaModels([]);
+      setOllamaModelsError(formatError(err));
+      setEditingModel("");
+    } finally {
+      if (isCurrentOllamaRequest(requestSeq)) {
+        setOllamaModelsLoading(false);
+      }
+    }
+  }
+
+  function isCurrentOllamaRequest(requestSeq: number): boolean {
+    return requestSeq === ollamaModelsRequestSeq && editingProvider()?.code === "ollama";
   }
 
   function applyEditor(event: Event): void {
@@ -133,21 +240,58 @@ function SettingsPage() {
     const provider = editingProvider();
     if (!provider) return;
 
+    if (provider.code === "ollama") {
+      applyOllamaEditor();
+      return;
+    }
+
     const trimmedModel = editingModel().trim();
-    setDraftDefaultModels((current) => {
-      const next = { ...current };
+    setDraftSettings((current) => {
+      const next = cloneSettings(current);
       if (trimmedModel) {
-        next[provider.code] = trimmedModel;
+        next.defaultModels[provider.code] = trimmedModel;
       } else {
-        delete next[provider.code];
+        delete next.defaultModels[provider.code];
       }
       return next;
     });
     closeEditor();
   }
 
+  function applyOllamaEditor(): void {
+    setFieldError("");
+    if (ollamaModelsLoading() || ollamaModelsError()) return;
+
+    const baseUrl = normalizeBaseUrlInput(editingBaseUrl());
+    if (!baseUrl.ok) {
+      setFieldError(baseUrl.error);
+      return;
+    }
+    const timeout = parseOptionalTimeout(editingTimeoutMs());
+    if (!timeout.ok) {
+      setFieldError(timeout.error);
+      return;
+    }
+    const model = editingModel();
+    if (!model || !ollamaModels().some((option) => option.value === model)) {
+      setFieldError("Select an Ollama model from the latest model list.");
+      return;
+    }
+
+    setDraftSettings((current) => {
+      const next = cloneSettings(current);
+      next.providerSettings.ollama = {
+        baseUrl: baseUrl.value,
+        timeoutMs: timeout.value ?? DEFAULT_OLLAMA_TIMEOUT_MS,
+      };
+      next.defaultModels.ollama = model;
+      return next;
+    });
+    closeEditor();
+  }
+
   function providerDefaultModel(provider: Provider): string {
-    return draftDefaultModels()[provider.code] || "auto";
+    return draftSettings().defaultModels[provider.code] || "auto";
   }
 
   return (
@@ -188,7 +332,7 @@ function SettingsPage() {
                   class="provider-option"
                   classList={{
                     "is-unavailable": !provider.available,
-                    "is-selected": selectedProvider() === provider.code,
+                    "is-selected": draftSettings().defaultProvider === provider.code,
                   }}
                 >
                   <label class="provider-radio">
@@ -196,9 +340,9 @@ function SettingsPage() {
                       type="radio"
                       name="defaultProvider"
                       value={provider.code}
-                      checked={selectedProvider() === provider.code}
+                      checked={draftSettings().defaultProvider === provider.code}
                       disabled={!provider.available}
-                      onChange={() => setSelectedProvider(provider.code)}
+                      onChange={() => setDraftProvider(provider.code)}
                     />
                   </label>
                   <span class="provider-main">
@@ -212,8 +356,8 @@ function SettingsPage() {
                   <button
                     type="button"
                     class="provider-edit-button"
-                    aria-label={`Edit ${provider.name} default model`}
-                    disabled={!provider.available || loading() || saving()}
+                    aria-label={`Edit ${provider.name} settings`}
+                    disabled={!canEditProvider(provider)}
                     onClick={() => openEditor(provider)}
                   >
                     Edit
@@ -244,22 +388,90 @@ function SettingsPage() {
                   <p>Edit provider settings</p>
                 </div>
               </header>
-              <label class="settings-field">
-                <span>
-                  Default Model <em>Optional</em>
-                </span>
-                <input
-                  type="text"
-                  value={editingModel()}
-                  onInput={(event) => setEditingModel(event.currentTarget.value)}
-                  autofocus
-                />
-              </label>
+
+              <Show
+                when={provider().code === "ollama"}
+                fallback={
+                  <label class="settings-field">
+                    <span>
+                      Default Model <em>Optional</em>
+                    </span>
+                    <input
+                      type="text"
+                      value={editingModel()}
+                      onInput={(event) => setEditingModel(event.currentTarget.value)}
+                      autofocus
+                    />
+                  </label>
+                }
+              >
+                <div class="settings-modal-fields">
+                  <label class="settings-field">
+                    <span>
+                      Base URL <em>Optional</em>
+                    </span>
+                    <input
+                      type="text"
+                      value={editingBaseUrl()}
+                      placeholder={DEFAULT_OLLAMA_BASE_URL}
+                      onInput={(event) => setEditingBaseUrl(event.currentTarget.value)}
+                      onBlur={() => loadOllamaModels()}
+                      autofocus
+                    />
+                  </label>
+                  <label class="settings-field">
+                    <span>
+                      Timeout Milliseconds <em>Optional</em>
+                    </span>
+                    <input
+                      type="text"
+                      inputmode="numeric"
+                      value={editingTimeoutMs()}
+                      placeholder={String(DEFAULT_OLLAMA_TIMEOUT_MS)}
+                      onInput={(event) => setEditingTimeoutMs(event.currentTarget.value)}
+                    />
+                  </label>
+                  <label class="settings-field">
+                    <span>
+                      Default Model <em>Required</em>
+                    </span>
+                    <select
+                      value={editingModel()}
+                      disabled={ollamaModelsLoading() || Boolean(ollamaModelsError()) || ollamaModels().length === 0}
+                      onChange={(event) => setEditingModel(event.currentTarget.value)}
+                    >
+                      <option value="">Select a model</option>
+                      <For each={ollamaModels()}>
+                        {(model) => <option value={model.value}>{model.label}</option>}
+                      </For>
+                    </select>
+                  </label>
+                  <div class="settings-modal-status" aria-live="polite">
+                    <Show when={ollamaModelsLoading()}>
+                      <span>Loading models...</span>
+                    </Show>
+                    <Show when={!ollamaModelsLoading() && !ollamaModelsError() && ollamaModels().length === 0}>
+                      <span>No Ollama models available.</span>
+                    </Show>
+                    <Show when={ollamaModelsError()}>
+                      <span class="settings-field-error">{ollamaModelsError()}</span>
+                    </Show>
+                    <Show when={fieldError()}>
+                      <span class="settings-field-error">{fieldError()}</span>
+                    </Show>
+                  </div>
+                </div>
+              </Show>
+
               <footer class="settings-modal-actions">
                 <button type="button" class="settings-secondary-button" onClick={closeEditor}>
                   Cancel
                 </button>
-                <button type="submit" class="settings-primary-button">
+                <button
+                  type="submit"
+                  class="settings-primary-button"
+                  disabled={provider().code === "ollama" && !canApplyOllama()}
+                >
                   Apply
                 </button>
               </footer>
@@ -285,5 +497,48 @@ function normalizeSettings(value: Settings | null | undefined): Settings {
   return {
     defaultProvider: value?.defaultProvider ?? null,
     defaultModels: { ...(value?.defaultModels ?? {}) },
+    providerSettings: {
+      ollama: {
+        baseUrl: value?.providerSettings?.ollama?.baseUrl ?? DEFAULT_OLLAMA_BASE_URL,
+        timeoutMs: value?.providerSettings?.ollama?.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS,
+      },
+    },
   };
+}
+
+function cloneSettings(settings: Settings): Settings {
+  return {
+    defaultProvider: settings.defaultProvider,
+    defaultModels: { ...settings.defaultModels },
+    providerSettings: {
+      ollama: { ...settings.providerSettings.ollama },
+    },
+  };
+}
+
+function normalizeBaseUrlInput(value: string): { ok: true; value: string } | { ok: false; error: string } {
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, value: DEFAULT_OLLAMA_BASE_URL };
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return { ok: false, error: "Base URL must use http:// or https://." };
+    }
+    return { ok: true, value: trimmed.replace(/\/+$/, "") };
+  } catch {
+    return { ok: false, error: "Base URL must be a valid absolute URL." };
+  }
+}
+
+function parseOptionalTimeout(value: string): { ok: true; value?: number } | { ok: false; error: string } {
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, value: DEFAULT_OLLAMA_TIMEOUT_MS };
+  if (!/^[0-9]+$/.test(trimmed)) {
+    return { ok: false, error: "Timeout must be a positive integer." };
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return { ok: false, error: "Timeout must be a positive integer." };
+  }
+  return { ok: true, value: parsed };
 }

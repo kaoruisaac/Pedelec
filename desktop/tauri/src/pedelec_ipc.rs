@@ -1349,7 +1349,16 @@ mod tests {
         assert!(initial.ok);
         assert_eq!(
             initial.result.unwrap(),
-            json!({ "defaultProvider": null, "defaultModels": {} })
+            json!({
+                "defaultProvider": null,
+                "defaultModels": {},
+                "providerSettings": {
+                    "ollama": {
+                        "baseUrl": "http://127.0.0.1:11434",
+                        "timeoutMs": 120000
+                    }
+                }
+            })
         );
 
         let updated = handle_core_ipc_request(
@@ -1361,6 +1370,12 @@ mod tests {
                     "defaultModels": {
                         "codex": " gpt-5 ",
                         "gemini": "gemini-2.5-pro"
+                    },
+                    "providerSettings": {
+                        "ollama": {
+                            "baseUrl": " http://127.0.0.1:11434/ ",
+                            "timeoutMs": 120000
+                        }
                     }
                 })),
             },
@@ -1374,6 +1389,12 @@ mod tests {
                 "defaultModels": {
                     "codex": "gpt-5",
                     "gemini": "gemini-2.5-pro"
+                },
+                "providerSettings": {
+                    "ollama": {
+                        "baseUrl": "http://127.0.0.1:11434",
+                        "timeoutMs": 120000
+                    }
                 }
             })
         );
@@ -1386,6 +1407,7 @@ mod tests {
                     (ProviderCode::Codex, "gpt-5".into()),
                     (ProviderCode::Gemini, "gemini-2.5-pro".into()),
                 ]),
+                provider_settings: Default::default(),
             }
         );
     }

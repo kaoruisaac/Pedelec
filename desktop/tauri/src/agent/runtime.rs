@@ -1,5 +1,5 @@
 use super::cli::parse_args;
-use super::config::resolve_config;
+use super::config::{resolve_config, resolve_config_with_settings_path};
 use super::error::AgentError;
 use super::jsonl::{AgentEvent, JsonlWriter};
 use super::model::{adapter_for, ModelMessage, ModelToolCall};
@@ -59,8 +59,20 @@ fn run_inner_with_session_root_and_prompt(
     session_root: Option<&Path>,
     prompt: String,
 ) -> Result<(), AgentError> {
+    run_inner_with_session_root_and_prompt_with_settings_path(args, session_root, prompt, None)
+}
+
+fn run_inner_with_session_root_and_prompt_with_settings_path(
+    args: Vec<String>,
+    session_root: Option<&Path>,
+    prompt: String,
+    settings_path: Option<&Path>,
+) -> Result<(), AgentError> {
     let cli = parse_args(args)?;
-    let config = resolve_config(&cli)?;
+    let config = match settings_path {
+        Some(path) => resolve_config_with_settings_path(&cli, path.to_path_buf())?,
+        None => resolve_config(&cli)?,
+    };
     if prompt.trim().is_empty() {
         return Err(AgentError::new("INVALID_ARGUMENT", "Prompt is required."));
     }
@@ -272,14 +284,25 @@ mod tests {
         std::fs::write(temp.path().join("README.md"), "hello readme").unwrap();
         let (base_url, handle) = fake_ollama_server();
         let env_file = temp.path().join(".env.local");
+        std::fs::write(&env_file, "PEDELEC_AGENT_MODEL=fake\n").unwrap();
+        let settings_path = temp.path().join("settings.json");
         std::fs::write(
-            &env_file,
-            format!("PEDELEC_AGENT_MODEL=fake\nOLLAMA_BASE_URL={base_url}\n"),
+            &settings_path,
+            format!(
+                r#"{{
+                    "providerSettings": {{
+                        "ollama": {{
+                            "baseUrl": "{base_url}",
+                            "timeoutMs": 120000
+                        }}
+                    }}
+                }}"#
+            ),
         )
         .unwrap();
 
         let agent_home = temp.path().join("agent-home");
-        run_inner_with_session_root_and_prompt(
+        run_inner_with_session_root_and_prompt_with_settings_path(
             vec![
                 "pedelec-agent".into(),
                 "--sandbox".into(),
@@ -289,6 +312,7 @@ mod tests {
             ],
             Some(&agent_home),
             "read".into(),
+            Some(&settings_path),
         )
         .unwrap();
         handle.join().unwrap();

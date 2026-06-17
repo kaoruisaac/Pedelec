@@ -79,9 +79,6 @@ pedelec-agent [run] \
 PEDELEC_AGENT_PROVIDER=ollama
 PEDELEC_AGENT_MODEL=qwen2.5-coder:7b
 
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_TIMEOUT_MS=120000
-
 PEDELEC_AGENT_SANDBOX=.
 PEDELEC_AGENT_MAX_TRANSCRIPT_BYTES=1048576
 PEDELEC_AGENT_MAX_TOOL_ROUNDS=8
@@ -97,6 +94,8 @@ PEDELEC_AGENT_PEDELEC_CLI_TIMEOUT_MS=60000
 ```txt
 CLI arguments > process env > .env.local > internal default
 ```
+
+Ollama Base URL 與 Timeout 不使用 `.env.local` 或 process env；`pedelec-agent` 會直接讀取 `~/.pedelec/settings.json` 的 `providerSettings.ollama`，缺少欄位時使用內建預設值。
 
 session 儲存位置不可透過 CLI 或環境變數覆寫，固定由 Pedelec home 推導。
 
