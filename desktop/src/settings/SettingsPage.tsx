@@ -1,6 +1,6 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onMount, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { OllamaModelOption, Provider, ProviderCode, ProviderSettings, Settings } from "./types";
+import { Provider, ProviderCode, ProviderSettings, Settings } from "./types";
 import { DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_TIMEOUT_MS } from "./constants";
 import { usePopUp } from "../services/PopUpProvider";
 import EditingProviderPopup from "./EditingProviderPopup";
