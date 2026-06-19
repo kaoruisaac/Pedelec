@@ -267,6 +267,8 @@ impl Default for ProviderSettings {
 pub struct OllamaProviderSettings {
     pub base_url: String,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub api_key: String,
 }
 
 impl Default for OllamaProviderSettings {
@@ -274,6 +276,7 @@ impl Default for OllamaProviderSettings {
         Self {
             base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
             timeout_ms: DEFAULT_OLLAMA_TIMEOUT_MS,
+            api_key: String::new(),
         }
     }
 }
@@ -289,6 +292,7 @@ pub struct ProviderSettingsInput {
 pub struct OllamaProviderSettingsInput {
     pub base_url: Option<String>,
     pub timeout_ms: Option<u64>,
+    pub api_key: Option<String>,
 }
 
 impl Default for ProviderSettingsInput {
@@ -297,6 +301,7 @@ impl Default for ProviderSettingsInput {
             ollama: OllamaProviderSettingsInput {
                 base_url: Some(DEFAULT_OLLAMA_BASE_URL.to_string()),
                 timeout_ms: Some(DEFAULT_OLLAMA_TIMEOUT_MS),
+                api_key: Some("ollama".to_string()),
             },
         }
     }
@@ -307,6 +312,7 @@ impl Default for ProviderSettingsInput {
 pub struct ListOllamaModelsInput {
     pub base_url: Option<String>,
     pub timeout_ms: Option<u64>,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -515,6 +521,7 @@ pub struct CommandSpec {
 pub struct RunPromptProviderContext {
     pub thread: ThreadState,
     pub provider_state: ProviderAdapterState,
+    pub settings: PedelecSettings,
     pub core_ipc_endpoint: String,
     pub core_ipc_runtime_file_path: PathBuf,
 }
@@ -1163,11 +1170,16 @@ impl ProviderAdapter for OllamaProviderAdapter {
             ctx.thread.sandbox_path.to_string_lossy().to_string(),
         ];
         let prompt = build_provider_run_prompt(&ctx.thread, message);
+        let mut env = build_provider_env(ctx)?;
+        env.push((
+            "OLLAMA_API_KEY".to_string(),
+            require_ollama_api_key(Some(ctx.settings.provider_settings.ollama.api_key.clone()))?,
+        ));
         Ok(CommandSpec {
             program: "pedelec-agent".to_string(),
             args,
             cwd: ctx.thread.sandbox_path.clone(),
-            env: build_provider_env(ctx)?,
+            env,
             prompt: prompt.clone(),
             stdin: prompt,
         })
@@ -1198,11 +1210,16 @@ impl ProviderAdapter for OllamaProviderAdapter {
             provider_session_id.to_string(),
         ];
         let prompt = build_provider_resume_prompt(message);
+        let mut env = build_provider_env(ctx)?;
+        env.push((
+            "OLLAMA_API_KEY".to_string(),
+            require_ollama_api_key(Some(ctx.settings.provider_settings.ollama.api_key.clone()))?,
+        ));
         Ok(CommandSpec {
             program: "pedelec-agent".to_string(),
             args,
             cwd: ctx.thread.sandbox_path.clone(),
-            env: build_provider_env(ctx)?,
+            env,
             prompt: prompt.clone(),
             stdin: prompt,
         })
@@ -1431,9 +1448,11 @@ impl CoreRuntime {
                     serde_json::json!({ "threadId": input.thread_id }),
                 )
             })?;
+        let settings = self.get_settings()?;
         let ctx = RunPromptProviderContext {
             thread,
             provider_state: provider_state.clone(),
+            settings,
             core_ipc_endpoint: self.core_ipc_endpoint.clone().unwrap_or_default(),
             core_ipc_runtime_file_path: self
                 .core_ipc_runtime_file_path
@@ -2946,11 +2965,14 @@ pub mod error_codes {
     pub const MODEL_REQUIRED: &str = "MODEL_REQUIRED";
     pub const SETTINGS_READ_FAILED: &str = "SETTINGS_READ_FAILED";
     pub const SETTINGS_WRITE_FAILED: &str = "SETTINGS_WRITE_FAILED";
-    pub const OLLAMA_SETTINGS_INVALID: &str = "OLLAMA_SETTINGS_INVALID";
-    pub const OLLAMA_MODELS_REQUEST_FAILED: &str = "OLLAMA_MODELS_REQUEST_FAILED";
-    pub const OLLAMA_MODELS_TIMEOUT: &str = "OLLAMA_MODELS_TIMEOUT";
-    pub const OLLAMA_MODELS_UNAVAILABLE: &str = "OLLAMA_MODELS_UNAVAILABLE";
-    pub const OLLAMA_MODELS_RESPONSE_INVALID: &str = "OLLAMA_MODELS_RESPONSE_INVALID";
+    pub const OLLAMA_API_KEY_REQUIRED: &str = "OLLAMA_API_KEY_REQUIRED";
+    pub const OLLAMA_AUTH_FAILED: &str = "OLLAMA_AUTH_FAILED";
+    pub const OLLAMA_MODEL_NOT_FOUND: &str = "OLLAMA_MODEL_NOT_FOUND";
+    pub const OLLAMA_CLOUD_LIMIT_EXCEEDED: &str = "OLLAMA_CLOUD_LIMIT_EXCEEDED";
+    pub const OLLAMA_BASE_URL_INVALID: &str = "OLLAMA_BASE_URL_INVALID";
+    pub const OLLAMA_UNAVAILABLE: &str = "OLLAMA_UNAVAILABLE";
+    pub const OLLAMA_REQUEST_FAILED: &str = "OLLAMA_REQUEST_FAILED";
+    pub const OLLAMA_RESPONSE_INVALID: &str = "OLLAMA_RESPONSE_INVALID";
 }
 
 fn provider_code_as_str(provider: &ProviderCode) -> &'static str {
@@ -3072,6 +3094,7 @@ fn normalize_ollama_provider_settings(
         timeout_ms: validate_ollama_timeout(
             settings.timeout_ms.unwrap_or(DEFAULT_OLLAMA_TIMEOUT_MS),
         )?,
+        api_key: require_ollama_api_key(settings.api_key)?,
     })
 }
 
@@ -3088,15 +3111,25 @@ pub fn validate_ollama_base_url(value: &str) -> Result<String, PedelecError> {
     let trimmed = value.trim();
     let parsed = Url::parse(trimmed).map_err(|err| {
         PedelecError::with_details(
-            error_codes::OLLAMA_SETTINGS_INVALID,
-            "Ollama Base URL must be an absolute http:// or https:// URL.",
+            error_codes::OLLAMA_BASE_URL_INVALID,
+            "Ollama Base URL must be a valid http(s) URL and must not include /api.",
             serde_json::json!({ "field": "baseUrl", "value": value, "error": err.to_string() }),
         )
     })?;
     if !matches!(parsed.scheme(), "http" | "https") || !parsed.has_host() {
         return Err(PedelecError::with_details(
-            error_codes::OLLAMA_SETTINGS_INVALID,
-            "Ollama Base URL must be an absolute http:// or https:// URL.",
+            error_codes::OLLAMA_BASE_URL_INVALID,
+            "Ollama Base URL must be a valid http(s) URL and must not include /api.",
+            serde_json::json!({ "field": "baseUrl", "value": value }),
+        ));
+    }
+    if parsed
+        .path_segments()
+        .is_some_and(|mut segments| segments.any(|segment| segment.eq_ignore_ascii_case("api")))
+    {
+        return Err(PedelecError::with_details(
+            error_codes::OLLAMA_BASE_URL_INVALID,
+            "Ollama Base URL must be a valid http(s) URL and must not include /api.",
             serde_json::json!({ "field": "baseUrl", "value": value }),
         ));
     }
@@ -3106,12 +3139,23 @@ pub fn validate_ollama_base_url(value: &str) -> Result<String, PedelecError> {
 pub fn validate_ollama_timeout(value: u64) -> Result<u64, PedelecError> {
     if value == 0 {
         return Err(PedelecError::with_details(
-            error_codes::OLLAMA_SETTINGS_INVALID,
+            error_codes::OLLAMA_REQUEST_FAILED,
             "Ollama timeout must be greater than 0 milliseconds.",
             serde_json::json!({ "field": "timeoutMs", "value": value }),
         ));
     }
     Ok(value)
+}
+
+fn require_ollama_api_key(value: Option<String>) -> Result<String, PedelecError> {
+    let trimmed = value.as_deref().map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return Err(PedelecError::new(
+            error_codes::OLLAMA_API_KEY_REQUIRED,
+            "Ollama API key is required. For local models, enter 'ollama'.",
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn list_ollama_models(
@@ -3120,33 +3164,30 @@ fn list_ollama_models(
     let base_url = normalize_ollama_base_url(input.base_url)?;
     let timeout_ms =
         validate_ollama_timeout(input.timeout_ms.unwrap_or(DEFAULT_OLLAMA_TIMEOUT_MS))?;
+    let api_key = require_ollama_api_key(input.api_key)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()
         .map_err(|err| {
             PedelecError::with_details(
-                error_codes::OLLAMA_MODELS_REQUEST_FAILED,
-                "Cannot create Ollama model list client.",
+                error_codes::OLLAMA_REQUEST_FAILED,
+                "Ollama request failed.",
                 serde_json::json!({ "error": err.to_string(), "timeoutMs": timeout_ms }),
             )
         })?;
     let url = format!("{base_url}/api/tags");
-    let response = client.get(&url).send().map_err(|err| {
-        let code = if err.is_timeout() {
-            error_codes::OLLAMA_MODELS_TIMEOUT
-        } else if err.is_connect() {
-            error_codes::OLLAMA_MODELS_UNAVAILABLE
+    let response = client.get(&url).bearer_auth(api_key).send().map_err(|err| {
+        let code = if err.is_timeout() || err.is_connect() {
+            error_codes::OLLAMA_UNAVAILABLE
         } else {
-            error_codes::OLLAMA_MODELS_REQUEST_FAILED
+            error_codes::OLLAMA_REQUEST_FAILED
         };
         PedelecError::with_details(
             code,
-            if err.is_timeout() {
-                "Ollama model list request timed out."
-            } else if err.is_connect() {
-                "Cannot connect to Ollama."
+            if code == error_codes::OLLAMA_UNAVAILABLE {
+                "Ollama is unavailable. Check the Base URL, network connection, and timeout setting."
             } else {
-                "Ollama model list request failed."
+                "Ollama request failed."
             },
             serde_json::json!({ "url": url, "timeoutMs": timeout_ms, "error": err.to_string() }),
         )
@@ -3154,26 +3195,46 @@ fn list_ollama_models(
     let status = response.status();
     let text = response.text().map_err(|err| {
         PedelecError::with_details(
-            error_codes::OLLAMA_MODELS_REQUEST_FAILED,
-            "Cannot read Ollama model list response.",
+            error_codes::OLLAMA_REQUEST_FAILED,
+            "Ollama request failed.",
             serde_json::json!({ "url": url, "error": err.to_string() }),
         )
     })?;
     if !status.is_success() {
-        return Err(PedelecError::with_details(
-            error_codes::OLLAMA_MODELS_REQUEST_FAILED,
-            "Ollama returned a non-success status while listing models.",
-            serde_json::json!({ "url": url, "status": status.as_u16(), "body": text }),
-        ));
+        return Err(ollama_http_status_error(status.as_u16(), &text, Some(url)));
     }
     parse_ollama_models_response(&text)
+}
+
+fn ollama_http_status_error(status: u16, body: &str, url: Option<String>) -> PedelecError {
+    let lower_body = body.to_ascii_lowercase();
+    let (code, message) = match status {
+        401 | 403 => (
+            error_codes::OLLAMA_AUTH_FAILED,
+            "Ollama authentication failed. Check your API key.",
+        ),
+        429 => (
+            error_codes::OLLAMA_CLOUD_LIMIT_EXCEEDED,
+            "Ollama Cloud limit was exceeded. Try again later or check your Ollama account usage.",
+        ),
+        404 if lower_body.contains("model") && lower_body.contains("not found") => (
+            error_codes::OLLAMA_MODEL_NOT_FOUND,
+            "Ollama model was not found. Refresh the model list and choose an available model.",
+        ),
+        _ => (error_codes::OLLAMA_REQUEST_FAILED, "Ollama request failed."),
+    };
+    let mut details = serde_json::json!({ "status": status, "body": body });
+    if let Some(url) = url {
+        details["url"] = Value::String(url);
+    }
+    PedelecError::with_details(code, message, details)
 }
 
 fn parse_ollama_models_response(text: &str) -> Result<Vec<OllamaModelOption>, PedelecError> {
     let value = serde_json::from_str::<Value>(text).map_err(|err| {
         PedelecError::with_details(
-            error_codes::OLLAMA_MODELS_RESPONSE_INVALID,
-            "Ollama model list response was not valid JSON.",
+            error_codes::OLLAMA_RESPONSE_INVALID,
+            "Ollama response was invalid.",
             serde_json::json!({ "error": err.to_string(), "body": text }),
         )
     })?;
@@ -3182,8 +3243,8 @@ fn parse_ollama_models_response(text: &str) -> Result<Vec<OllamaModelOption>, Pe
         .and_then(Value::as_array)
         .ok_or_else(|| {
             PedelecError::with_details(
-                error_codes::OLLAMA_MODELS_RESPONSE_INVALID,
-                "Ollama model list response did not include a valid models array.",
+                error_codes::OLLAMA_RESPONSE_INVALID,
+                "Ollama response was invalid.",
                 serde_json::json!({ "body": value }),
             )
         })?;
@@ -5092,9 +5153,47 @@ mod tests {
         assert_env(&start.command, "PEDELEC_THREAD_ID", "thread_ollama_new");
         assert_env(&start.command, "PEDELEC_PROVIDER", "ollama");
         assert_env(&start.command, "PEDELEC_MODEL", "qwen3-14b-32k:latest");
+        assert_env(&start.command, "OLLAMA_API_KEY", "ollama_test_key");
+        assert!(!start
+            .command
+            .args
+            .iter()
+            .any(|arg| arg == "ollama_test_key"));
+        assert!(!start.command.prompt.contains("ollama_test_key"));
         assert!(env_value(&start.command, "PATH")
             .unwrap()
             .contains(".pedelec"));
+    }
+
+    #[test]
+    fn ollama_provider_command_started_event_does_not_include_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = runtime_with_provider_thread(
+            temp.path(),
+            "thread_ollama_command_event",
+            ProviderCode::Ollama,
+            None,
+            Some("qwen3:8b".into()),
+        );
+        let event_rx = runtime.event_bus.subscribe("thread_ollama_command_event");
+        let start = runtime
+            .begin_send_text(SendTextInput {
+                thread_id: "thread_ollama_command_event".into(),
+                message: "hello".into(),
+            })
+            .unwrap();
+
+        runtime.emit_provider_command_started(
+            "thread_ollama_command_event",
+            123,
+            &start.command,
+        );
+        let events = collect_available_core_events(&event_rx);
+        let payload = serde_json::to_string(&events).unwrap();
+
+        assert!(payload.contains("pedelec-agent"));
+        assert!(!payload.contains("ollama_test_key"));
+        assert!(!payload.contains("OLLAMA_API_KEY"));
     }
 
     #[test]
@@ -5137,6 +5236,7 @@ mod tests {
         assert_eq!(start.command.stdin, "continue");
         assert_provider_instruction_absent(&start.command);
         assert_env(&start.command, "PEDELEC_THREAD_ID", "thread_outer");
+        assert_env(&start.command, "OLLAMA_API_KEY", "ollama_test_key");
         assert_ne!(provider_session_id, "thread_outer");
     }
 
@@ -5368,6 +5468,7 @@ mod tests {
                 ollama: OllamaProviderSettings {
                     base_url: "http://127.0.0.1:11434".into(),
                     timeout_ms: 120_000,
+                    api_key: "ollama_xxx".into(),
                 },
             },
         };
@@ -5384,7 +5485,8 @@ mod tests {
                 "providerSettings": {
                     "ollama": {
                         "baseUrl": "http://127.0.0.1:11434",
-                        "timeoutMs": 120000
+                        "timeoutMs": 120000,
+                        "apiKey": "ollama_xxx"
                     }
                 }
             })
@@ -5393,6 +5495,25 @@ mod tests {
             serde_json::from_value::<PedelecSettings>(value).unwrap(),
             settings
         );
+    }
+
+    #[test]
+    fn settings_legacy_ollama_shape_defaults_missing_api_key() {
+        let settings = serde_json::from_value::<PedelecSettings>(json!({
+            "defaultProvider": "ollama",
+            "defaultModels": {
+                "ollama": "qwen3:8b"
+            },
+            "providerSettings": {
+                "ollama": {
+                    "baseUrl": "http://127.0.0.1:11434",
+                    "timeoutMs": 120000
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(settings.provider_settings.ollama.api_key, "");
     }
 
     #[test]
@@ -5425,7 +5546,12 @@ mod tests {
                     (ProviderCode::Codex, "gpt-5".into()),
                     (ProviderCode::Ollama, "qwen3-14b-32k:latest".into()),
                 ]),
-                provider_settings: ProviderSettings::default(),
+                provider_settings: ProviderSettings {
+                    ollama: OllamaProviderSettings {
+                        api_key: "ollama".into(),
+                        ..OllamaProviderSettings::default()
+                    },
+                },
             }
         );
         assert_eq!(read_settings_file(&settings_path).unwrap(), saved);
@@ -5450,6 +5576,7 @@ mod tests {
                     ollama: OllamaProviderSettingsInput {
                         base_url: Some(" https://ollama.example.test/ ".into()),
                         timeout_ms: Some(250_000),
+                        api_key: Some(" ollama_cloud_key ".into()),
                     },
                 },
             })
@@ -5460,6 +5587,7 @@ mod tests {
             "https://ollama.example.test"
         );
         assert_eq!(saved.provider_settings.ollama.timeout_ms, 250_000);
+        assert_eq!(saved.provider_settings.ollama.api_key, "ollama_cloud_key");
         assert_eq!(read_settings_file(&settings_path).unwrap(), saved);
     }
 
@@ -5481,15 +5609,21 @@ mod tests {
                     ollama: OllamaProviderSettingsInput {
                         base_url: Some("   ".into()),
                         timeout_ms: None,
+                        api_key: Some("ollama".into()),
                     },
                 },
             })
             .unwrap();
 
         assert_eq!(
-            saved.provider_settings.ollama,
-            OllamaProviderSettings::default()
+            saved.provider_settings.ollama.base_url,
+            DEFAULT_OLLAMA_BASE_URL
         );
+        assert_eq!(
+            saved.provider_settings.ollama.timeout_ms,
+            DEFAULT_OLLAMA_TIMEOUT_MS
+        );
+        assert_eq!(saved.provider_settings.ollama.api_key, "ollama");
     }
 
     #[test]
@@ -5510,11 +5644,12 @@ mod tests {
                     ollama: OllamaProviderSettingsInput {
                         base_url: Some("ftp://127.0.0.1:11434".into()),
                         timeout_ms: Some(120_000),
+                        api_key: Some("ollama".into()),
                     },
                 },
             })
             .unwrap_err();
-        assert_eq!(invalid_url.code, error_codes::OLLAMA_SETTINGS_INVALID);
+        assert_eq!(invalid_url.code, error_codes::OLLAMA_BASE_URL_INVALID);
 
         let invalid_timeout = runtime
             .update_settings(UpdateSettingsInput {
@@ -5524,11 +5659,27 @@ mod tests {
                     ollama: OllamaProviderSettingsInput {
                         base_url: Some(DEFAULT_OLLAMA_BASE_URL.into()),
                         timeout_ms: Some(0),
+                        api_key: Some("ollama".into()),
                     },
                 },
             })
             .unwrap_err();
-        assert_eq!(invalid_timeout.code, error_codes::OLLAMA_SETTINGS_INVALID);
+        assert_eq!(invalid_timeout.code, error_codes::OLLAMA_REQUEST_FAILED);
+
+        let missing_api_key = runtime
+            .update_settings(UpdateSettingsInput {
+                default_provider: ProviderCode::Ollama,
+                default_models: HashMap::new(),
+                provider_settings: ProviderSettingsInput {
+                    ollama: OllamaProviderSettingsInput {
+                        base_url: Some(DEFAULT_OLLAMA_BASE_URL.into()),
+                        timeout_ms: Some(120_000),
+                        api_key: Some("   ".into()),
+                    },
+                },
+            })
+            .unwrap_err();
+        assert_eq!(missing_api_key.code, error_codes::OLLAMA_API_KEY_REQUIRED);
     }
 
     #[test]
@@ -5619,11 +5770,13 @@ mod tests {
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(format!("{base_url}/")),
                 timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap();
         let request = handle.join().unwrap();
 
         assert!(request.starts_with("GET /api/tags "));
+        assert!(request.contains("authorization: Bearer ollama_test_key"));
         assert_eq!(
             models,
             vec![
@@ -5646,6 +5799,7 @@ mod tests {
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(base_url),
                 timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap();
         handle.join().unwrap();
@@ -5660,20 +5814,53 @@ mod tests {
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(base_url),
                 timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap_err();
         http_handle.join().unwrap();
-        assert_eq!(http_err.code, error_codes::OLLAMA_MODELS_REQUEST_FAILED);
+        assert_eq!(http_err.code, error_codes::OLLAMA_REQUEST_FAILED);
 
         let (base_url, json_handle) = start_single_response_server(200, "{not-json");
         let json_err = CoreRuntime::default()
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(base_url),
                 timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap_err();
         json_handle.join().unwrap();
-        assert_eq!(json_err.code, error_codes::OLLAMA_MODELS_RESPONSE_INVALID);
+        assert_eq!(json_err.code, error_codes::OLLAMA_RESPONSE_INVALID);
+    }
+
+    #[test]
+    fn list_ollama_models_maps_cloud_http_status_errors() {
+        let cases = [
+            (401, "bad key", error_codes::OLLAMA_AUTH_FAILED),
+            (403, "forbidden", error_codes::OLLAMA_AUTH_FAILED),
+            (
+                404,
+                "model was not found",
+                error_codes::OLLAMA_MODEL_NOT_FOUND,
+            ),
+            (
+                429,
+                "quota exceeded",
+                error_codes::OLLAMA_CLOUD_LIMIT_EXCEEDED,
+            ),
+        ];
+
+        for (status, body, expected_code) in cases {
+            let (base_url, handle) = start_single_response_server(status, body);
+            let err = CoreRuntime::default()
+                .list_ollama_models(ListOllamaModelsInput {
+                    base_url: Some(base_url),
+                    timeout_ms: Some(120_000),
+                    api_key: Some("ollama_test_key".into()),
+                })
+                .unwrap_err();
+            handle.join().unwrap();
+            assert_eq!(err.code, expected_code);
+        }
     }
 
     #[test]
@@ -5683,26 +5870,47 @@ mod tests {
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(base_url),
                 timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap_err();
         handle.join().unwrap();
-        assert_eq!(shape_err.code, error_codes::OLLAMA_MODELS_RESPONSE_INVALID);
+        assert_eq!(shape_err.code, error_codes::OLLAMA_RESPONSE_INVALID);
 
         let url_err = CoreRuntime::default()
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some("not-a-url".into()),
                 timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap_err();
-        assert_eq!(url_err.code, error_codes::OLLAMA_SETTINGS_INVALID);
+        assert_eq!(url_err.code, error_codes::OLLAMA_BASE_URL_INVALID);
+
+        let url_with_api_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some("https://ollama.com/api".into()),
+                timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
+            })
+            .unwrap_err();
+        assert_eq!(url_with_api_err.code, error_codes::OLLAMA_BASE_URL_INVALID);
 
         let timeout_err = CoreRuntime::default()
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(DEFAULT_OLLAMA_BASE_URL.into()),
                 timeout_ms: Some(0),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap_err();
-        assert_eq!(timeout_err.code, error_codes::OLLAMA_SETTINGS_INVALID);
+        assert_eq!(timeout_err.code, error_codes::OLLAMA_REQUEST_FAILED);
+
+        let missing_key_err = CoreRuntime::default()
+            .list_ollama_models(ListOllamaModelsInput {
+                base_url: Some(DEFAULT_OLLAMA_BASE_URL.into()),
+                timeout_ms: Some(120_000),
+                api_key: Some(" ".into()),
+            })
+            .unwrap_err();
+        assert_eq!(missing_key_err.code, error_codes::OLLAMA_API_KEY_REQUIRED);
     }
 
     #[test]
@@ -5715,9 +5923,10 @@ mod tests {
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(refused_url),
                 timeout_ms: Some(120_000),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap_err();
-        assert_eq!(refused_err.code, error_codes::OLLAMA_MODELS_UNAVAILABLE);
+        assert_eq!(refused_err.code, error_codes::OLLAMA_UNAVAILABLE);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let timeout_url = format!("http://{}", listener.local_addr().unwrap());
@@ -5729,10 +5938,11 @@ mod tests {
             .list_ollama_models(ListOllamaModelsInput {
                 base_url: Some(timeout_url),
                 timeout_ms: Some(1),
+                api_key: Some("ollama_test_key".into()),
             })
             .unwrap_err();
         handle.join().unwrap();
-        assert_eq!(timeout_err.code, error_codes::OLLAMA_MODELS_TIMEOUT);
+        assert_eq!(timeout_err.code, error_codes::OLLAMA_UNAVAILABLE);
     }
 
     #[test]
@@ -7047,7 +7257,7 @@ mod tests {
                 body
             )
             .unwrap();
-            request.lines().next().unwrap_or_default().to_string()
+            request
         });
 
         (format!("http://{address}"), handle)
@@ -7093,8 +7303,22 @@ mod tests {
     ) -> CoreRuntime {
         let mut runtime = CoreRuntime {
             sandbox_manager: SandboxManager::with_sandbox_root(temp.join("sandbox")),
+            settings_file_path: Some(temp.join("settings.json")),
             ..CoreRuntime::default()
         };
+        write_settings_file(
+            &temp.join("settings.json"),
+            &PedelecSettings {
+                provider_settings: ProviderSettings {
+                    ollama: OllamaProviderSettings {
+                        api_key: "ollama_test_key".into(),
+                        ..OllamaProviderSettings::default()
+                    },
+                },
+                ..PedelecSettings::default()
+            },
+        )
+        .unwrap();
         runtime.set_core_ipc_runtime("127.0.0.1:12345", temp.join("runtime.json"));
         let sandbox_path = temp.join("sandbox").join(thread_id);
         fs::create_dir_all(sandbox_path.join("logs")).unwrap();

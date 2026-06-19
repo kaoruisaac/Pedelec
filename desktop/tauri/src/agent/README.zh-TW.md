@@ -97,6 +97,14 @@ CLI arguments > process env > .env.local > internal default
 
 Ollama Base URL 與 Timeout 不使用 `.env.local` 或 process env；`pedelec-agent` 會直接讀取 `~/.pedelec/settings.json` 的 `providerSettings.ollama`，缺少欄位時使用內建預設值。
 
+Ollama API key 只從 process env 的 `OLLAMA_API_KEY` 讀取，不從 `.env.local` 讀取，也沒有 CLI 參數。使用本機 Ollama 時仍需提供任意非空值，例如：
+
+```bash
+OLLAMA_API_KEY=ollama pedelec-agent --sandbox . --provider ollama --model qwen2.5-coder:7b
+```
+
+使用 Ollama Cloud 時，`~/.pedelec/settings.json` 的 `providerSettings.ollama.baseUrl` 應為 `https://ollama.com`，不可包含 `/api`；`pedelec-agent` 會呼叫 `{baseUrl}/api/chat` 並送出 `Authorization: Bearer <OLLAMA_API_KEY>`。
+
 session 儲存位置不可透過 CLI 或環境變數覆寫，固定由 Pedelec home 推導。
 
 ## Session 與 Transcript
@@ -145,6 +153,7 @@ stdout 每一行都是一個 JSON object：
 
 ```bash
 printf '%s' '請讀取 README.md 並用條列整理重點' | \
+OLLAMA_API_KEY=ollama \
 pedelec-agent \
   --sandbox .
 ```
@@ -153,6 +162,7 @@ pedelec-agent \
 
 ```bash
 printf '%s' '請閱讀 sdk/src/index.ts 並說明 Pedelec SDK 的主要 API' | \
+OLLAMA_API_KEY=ollama \
 pedelec-agent \
   --sandbox . \
   --provider ollama \
@@ -163,6 +173,7 @@ pedelec-agent \
 
 ```bash
 printf '%s' '請呼叫 get_current_page 並整理目前頁面資訊' | \
+OLLAMA_API_KEY=ollama \
 PEDELEC_THREAD_ID=<pedelec_thread_id> pedelec-agent \
   --sandbox . \
   --pedelec-cli ./desktop/tauri/target/debug/pedelec-cli \

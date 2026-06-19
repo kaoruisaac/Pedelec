@@ -9,13 +9,15 @@ interface EditingProviderPopupProps {
     editingModel?: string;
     editingBaseUrl: string;
     editingTimeoutMs: string;
-    onApply: ({ model, baseUrl, timeoutMs }: { model: string; baseUrl?: string; timeoutMs?: number }) => void;
+    editingApiKey: string;
+    onApply: ({ model, baseUrl, timeoutMs, apiKey }: { model: string; baseUrl?: string; timeoutMs?: number; apiKey?: string }) => void;
 }
 
 const EditingProviderPopup = forwardPopUp((popup, props: EditingProviderPopupProps) => {
     const [editingModel, setEditingModel] = createSignal(props.editingModel ?? "");
     const [editingBaseUrl, setEditingBaseUrl] = createSignal(props.editingBaseUrl ?? "");
     const [editingTimeoutMs, setEditingTimeoutMs] = createSignal(props.editingTimeoutMs ?? "");
+    const [editingApiKey, setEditingApiKey] = createSignal(props.editingApiKey ?? "");
     const [ollamaModelsLoading, setOllamaModelsLoading] = createSignal(false);
     const [ollamaModelsError, setOllamaModelsError] = createSignal("");
     const [ollamaModels, setOllamaModels] = createSignal<OllamaModelOption[]>([]);
@@ -29,16 +31,29 @@ const EditingProviderPopup = forwardPopUp((popup, props: EditingProviderPopupPro
     
     async function loadOllamaModels(
         baseUrlValue = editingBaseUrl(),
+        apiKeyValue = editingApiKey(),
         timeoutValue = editingTimeoutMs(),
         currentModel = editingModel(),
       ): Promise<void> {
         setFieldError("");
         setOllamaModelsError("");
         setOllamaModels([]);
+
+        const baseUrl = normalizeBaseUrlInput(baseUrlValue);
+        if (!baseUrl.ok) {
+          setFieldError(baseUrl.error);
+          return;
+        }
     
         const timeout = parseOptionalTimeout(timeoutValue);
         if (!timeout.ok) {
           setFieldError(timeout.error);
+          return;
+        }
+
+        const apiKey = normalizeApiKeyInput(apiKeyValue);
+        if (!apiKey.ok) {
+          setFieldError(apiKey.error);
           return;
         }
     
@@ -46,7 +61,8 @@ const EditingProviderPopup = forwardPopUp((popup, props: EditingProviderPopupPro
         try {
           const models = await invoke<OllamaModelOption[]>("list_ollama_models", {
             input: {
-              baseUrl: baseUrlValue,
+              baseUrl: baseUrl.value,
+              apiKey: apiKey.value,
               timeoutMs: timeout.value,
             },
           });
@@ -96,12 +112,17 @@ const EditingProviderPopup = forwardPopUp((popup, props: EditingProviderPopupPro
         setFieldError(timeout.error);
         return;
     }
+    const apiKey = normalizeApiKeyInput(editingApiKey());
+    if (!apiKey.ok) {
+        setFieldError(apiKey.error);
+        return;
+    }
     const model = editingModel();
     if (!model || !ollamaModels().some((option) => option.value === model)) {
         setFieldError("Select an Ollama model from the latest model list.");
         return;
     }
-    props.onApply({ model, baseUrl: baseUrl.value, timeoutMs: timeout.value });
+    props.onApply({ model, baseUrl: baseUrl.value, timeoutMs: timeout.value, apiKey: apiKey.value });
     popup.close();
     }
 
@@ -146,6 +167,18 @@ const EditingProviderPopup = forwardPopUp((popup, props: EditingProviderPopupPro
                     onInput={(event) => setEditingBaseUrl(event.currentTarget.value)}
                     onBlur={() => loadOllamaModels()}
                     autofocus
+                />
+                </label>
+                <label class="settings-field">
+                <span>
+                    API Key <em>Required</em>
+                </span>
+                <input
+                    type="password"
+                    value={editingApiKey()}
+                    placeholder={"若為本地模型則輸入: 'ollama'"}
+                    onInput={(event) => setEditingApiKey(event.currentTarget.value)}
+                    onBlur={() => loadOllamaModels()}
                 />
                 </label>
                 <label class="settings-field">
@@ -236,8 +269,19 @@ function normalizeBaseUrlInput(value: string): { ok: true; value: string } | { o
       if (url.protocol !== "http:" && url.protocol !== "https:") {
         return { ok: false, error: "Base URL must use http:// or https://." };
       }
+      if (url.pathname.split("/").some((segment) => segment.toLowerCase() === "api")) {
+        return { ok: false, error: "Base URL must not include /api. Use https://ollama.com or http://127.0.0.1:11434." };
+      }
       return { ok: true, value: trimmed.replace(/\/+$/, "") };
     } catch {
       return { ok: false, error: "Base URL must be a valid absolute URL." };
     }
+}
+
+function normalizeApiKeyInput(value: string): { ok: true; value: string } | { ok: false; error: string } {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return { ok: false, error: "Ollama API key is required. For local models, enter 'ollama'." };
+    }
+    return { ok: true, value: trimmed };
 }

@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "pedelec-app"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "dirs",

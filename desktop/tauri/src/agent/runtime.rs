@@ -285,6 +285,7 @@ mod tests {
         let (base_url, handle) = fake_ollama_server();
         let env_file = temp.path().join(".env.local");
         std::fs::write(&env_file, "PEDELEC_AGENT_MODEL=fake\n").unwrap();
+        std::env::set_var("OLLAMA_API_KEY", "ollama_runtime_key");
         let settings_path = temp.path().join("settings.json");
         std::fs::write(
             &settings_path,
@@ -348,7 +349,10 @@ mod tests {
             for index in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buffer = [0; 8192];
-                let _ = stream.read(&mut buffer).unwrap();
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                assert!(request.starts_with("POST /api/chat "));
+                assert!(request.contains("authorization: Bearer "));
                 let body = if index == 0 {
                     r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"fs.read_text_file","arguments":{"path":"README.md"}}}]}}"#
                 } else {

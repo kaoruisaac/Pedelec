@@ -12,6 +12,7 @@ const emptySettings: Settings = {
     ollama: {
       baseUrl: DEFAULT_OLLAMA_BASE_URL,
       timeoutMs: DEFAULT_OLLAMA_TIMEOUT_MS,
+      apiKey: "",
     },
   },
 };
@@ -103,12 +104,23 @@ function SettingsPage() {
       EditingProviderPopup, {
         provider,
         editingBaseUrl: providerSettings.baseUrl,
+        editingApiKey: providerSettings.apiKey,
         editingModel: draftSettings().defaultModels[provider.code],
         editingTimeoutMs: String(draftSettings().providerSettings.ollama.timeoutMs),
-        onApply: ({ model, baseUrl, timeoutMs }: { model: string; baseUrl?: string; timeoutMs?: number }) => {
+        onApply: ({ model, baseUrl, timeoutMs, apiKey }: { model: string; baseUrl?: string; timeoutMs?: number; apiKey?: string }) => {
           setDraftSettings((current) => ({ ...current, defaultModels: { ...current.defaultModels, [provider.code]: model } }));
           if (provider.code === "ollama") {
-            setDraftSettings((current) => ({ ...current, providerSettings: { ...current.providerSettings, ollama: { baseUrl: baseUrl ?? DEFAULT_OLLAMA_BASE_URL, timeoutMs: timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS } } }));
+            setDraftSettings((current) => ({
+              ...current,
+              providerSettings: {
+                ...current.providerSettings,
+                ollama: {
+                  baseUrl: baseUrl ?? DEFAULT_OLLAMA_BASE_URL,
+                  timeoutMs: timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS,
+                  apiKey: apiKey ?? "",
+                },
+              },
+            }));
           }
         }
       }
@@ -229,6 +241,7 @@ function normalizeSettings(value: Settings | null | undefined): Settings {
       ollama: {
         baseUrl: value?.providerSettings?.ollama?.baseUrl ?? DEFAULT_OLLAMA_BASE_URL,
         timeoutMs: value?.providerSettings?.ollama?.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS,
+        apiKey: value?.providerSettings?.ollama?.apiKey ?? "",
       },
     },
   };

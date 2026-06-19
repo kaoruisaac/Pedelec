@@ -52,6 +52,7 @@ pub fn adapter_for(config: &AgentConfig) -> Result<Box<dyn ModelAdapter>, AgentE
 struct OllamaAdapter {
     base_url: String,
     model: String,
+    api_key: String,
     timeout_ms: u64,
     client: reqwest::blocking::Client,
 }
@@ -71,6 +72,7 @@ impl OllamaAdapter {
         Ok(Self {
             base_url: config.ollama_base_url.trim_end_matches('/').to_string(),
             model: config.model.clone(),
+            api_key: config.ollama_api_key.clone(),
             timeout_ms: config.ollama_timeout_ms,
             client,
         })
@@ -95,6 +97,7 @@ impl ModelAdapter for OllamaAdapter {
         let response = self
             .client
             .post(format!("{}/api/chat", self.base_url))
+            .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .body(body.to_string())
             .send()
@@ -106,7 +109,11 @@ impl ModelAdapter for OllamaAdapter {
                 };
                 AgentError::with_details(
                     code,
-                    "Ollama request failed",
+                    if code == "OLLAMA_UNAVAILABLE" {
+                        "Ollama is unavailable. Check the Base URL, network connection, and timeout setting."
+                    } else {
+                        "Ollama request failed."
+                    },
                     serde_json::json!({ "error": err.to_string(), "timeoutMs": self.timeout_ms }),
                 )
             })?;
@@ -114,33 +121,53 @@ impl ModelAdapter for OllamaAdapter {
         let text = response.text().map_err(|err| {
             AgentError::with_details(
                 "OLLAMA_REQUEST_FAILED",
-                "Failed to read Ollama response",
+                "Ollama request failed.",
                 serde_json::json!({ "error": err.to_string() }),
             )
         })?;
         if !status.is_success() {
-            return Err(AgentError::with_details(
-                "OLLAMA_REQUEST_FAILED",
-                "Ollama returned an error",
-                serde_json::json!({ "status": status.as_u16(), "body": text }),
-            ));
+            return Err(ollama_http_status_error(status.as_u16(), &text));
         }
         parse_ollama_response(&text)
     }
+}
+
+fn ollama_http_status_error(status: u16, body: &str) -> AgentError {
+    let lower_body = body.to_ascii_lowercase();
+    let (code, message) = match status {
+        401 | 403 => (
+            "OLLAMA_AUTH_FAILED",
+            "Ollama authentication failed. Check your API key.",
+        ),
+        429 => (
+            "OLLAMA_CLOUD_LIMIT_EXCEEDED",
+            "Ollama Cloud limit was exceeded. Try again later or check your Ollama account usage.",
+        ),
+        404 if lower_body.contains("model") && lower_body.contains("not found") => (
+            "OLLAMA_MODEL_NOT_FOUND",
+            "Ollama model was not found. Refresh the model list and choose an available model.",
+        ),
+        _ => ("OLLAMA_REQUEST_FAILED", "Ollama request failed."),
+    };
+    AgentError::with_details(
+        code,
+        message,
+        serde_json::json!({ "status": status, "body": body }),
+    )
 }
 
 fn parse_ollama_response(text: &str) -> Result<ModelTurnOutput, AgentError> {
     let value = serde_json::from_str::<Value>(text).map_err(|err| {
         AgentError::with_details(
             "OLLAMA_RESPONSE_INVALID",
-            "Ollama response was not valid JSON",
+            "Ollama response was invalid.",
             serde_json::json!({ "error": err.to_string(), "body": text }),
         )
     })?;
     let message = value.get("message").ok_or_else(|| {
         AgentError::with_details(
             "OLLAMA_RESPONSE_INVALID",
-            "Ollama response did not include message",
+            "Ollama response was invalid.",
             serde_json::json!({ "body": value }),
         )
     })?;
@@ -177,6 +204,11 @@ fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::config::{AgentConfig, ModelProvider};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::thread;
 
     #[test]
     fn parses_ollama_tool_call() {
@@ -186,5 +218,94 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.tool_calls[0].function.name, "fs.read_text_file");
+    }
+
+    #[test]
+    fn ollama_adapter_posts_native_chat_with_authorization_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 8192];
+            let bytes_read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let body = r#"{"message":{"role":"assistant","content":"hello"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+        let config = test_config(format!("http://{addr}"), "ollama_chat_key");
+        let adapter = OllamaAdapter::new(&config).unwrap();
+
+        let output = adapter
+            .run_turn(
+                &[ModelMessage {
+                    role: "user".into(),
+                    content: Some("hi".into()),
+                    tool_calls: None,
+                }],
+                &serde_json::json!([]),
+            )
+            .unwrap();
+        let request = handle.join().unwrap();
+
+        assert_eq!(output.text.as_deref(), Some("hello"));
+        assert!(request.starts_with("POST /api/chat "));
+        assert!(request.contains("authorization: Bearer ollama_chat_key"));
+        assert!(request.contains("content-type: application/json"));
+    }
+
+    #[test]
+    fn ollama_adapter_maps_status_without_leaking_api_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 8192];
+            let _ = stream.read(&mut buffer).unwrap();
+            let body = r#"{"error":"unauthorized"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let config = test_config(format!("http://{addr}"), "secret_api_key");
+        let adapter = OllamaAdapter::new(&config).unwrap();
+
+        let err = adapter.run_turn(&[], &serde_json::json!([])).unwrap_err();
+        handle.join().unwrap();
+
+        assert_eq!(err.code, "OLLAMA_AUTH_FAILED");
+        assert!(!serde_json::to_string(&err)
+            .unwrap()
+            .contains("secret_api_key"));
+    }
+
+    fn test_config(base_url: String, api_key: &str) -> AgentConfig {
+        AgentConfig {
+            provider: ModelProvider::Ollama,
+            provider_name: "ollama".into(),
+            model: "fake".into(),
+            ollama_base_url: base_url,
+            ollama_timeout_ms: 120_000,
+            ollama_api_key: api_key.into(),
+            sandbox: PathBuf::from("."),
+            pedelec_cli_path: None,
+            core_runtime_file: None,
+            pedelec_thread_id: None,
+            max_transcript_bytes: 1024,
+            max_tool_rounds: 8,
+            max_list_files: 200,
+            max_file_bytes: 1024,
+            pedelec_cli_timeout_ms: 1000,
+        }
     }
 }

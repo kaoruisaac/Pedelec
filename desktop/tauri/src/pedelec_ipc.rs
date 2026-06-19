@@ -1082,8 +1082,9 @@ mod tests {
     use super::*;
     use crate::pedelec_cli::run_tool_cli_with_runtime_file_path;
     use crate::pedelec_core::{
-        CommandSpec, CoreRuntime, CreateThreadOutput, PedelecSettings, ProviderAdapterState,
-        ProviderCode, SandboxManager, ThreadState, ThreadStatus, ToolRegistry,
+        CommandSpec, CoreRuntime, CreateThreadOutput, OllamaProviderSettings, PedelecSettings,
+        ProviderAdapterState, ProviderCode, ProviderSettings, SandboxManager, ThreadState,
+        ThreadStatus, ToolRegistry,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1355,7 +1356,8 @@ mod tests {
                 "providerSettings": {
                     "ollama": {
                         "baseUrl": "http://127.0.0.1:11434",
-                        "timeoutMs": 120000
+                        "timeoutMs": 120000,
+                        "apiKey": ""
                     }
                 }
             })
@@ -1374,7 +1376,8 @@ mod tests {
                     "providerSettings": {
                         "ollama": {
                             "baseUrl": " http://127.0.0.1:11434/ ",
-                            "timeoutMs": 120000
+                            "timeoutMs": 120000,
+                            "apiKey": "ollama"
                         }
                     }
                 })),
@@ -1393,7 +1396,8 @@ mod tests {
                 "providerSettings": {
                     "ollama": {
                         "baseUrl": "http://127.0.0.1:11434",
-                        "timeoutMs": 120000
+                        "timeoutMs": 120000,
+                        "apiKey": "ollama"
                     }
                 }
             })
@@ -1407,7 +1411,12 @@ mod tests {
                     (ProviderCode::Codex, "gpt-5".into()),
                     (ProviderCode::Gemini, "gemini-2.5-pro".into()),
                 ]),
-                provider_settings: Default::default(),
+                provider_settings: ProviderSettings {
+                    ollama: OllamaProviderSettings {
+                        api_key: "ollama".into(),
+                        ..OllamaProviderSettings::default()
+                    },
+                },
             }
         );
     }
