@@ -99,12 +99,12 @@ function SettingsPage() {
 
   function openEditor(provider: Provider): void {
     if (!canEditProvider(provider)) return;
-    const providerSettings = draftSettings().providerSettings[provider.code as keyof ProviderSettings];
+    const providerSettings = draftSettings().providerSettings[provider.code as keyof ProviderSettings] || {};
     pop(
       EditingProviderPopup, {
         provider,
-        editingBaseUrl: providerSettings.baseUrl,
-        editingApiKey: providerSettings.apiKey,
+        editingBaseUrl: providerSettings?.baseUrl,
+        editingApiKey: providerSettings?.apiKey,
         editingModel: draftSettings().defaultModels[provider.code],
         editingTimeoutMs: String(draftSettings().providerSettings.ollama.timeoutMs),
         onApply: ({ model, baseUrl, timeoutMs, apiKey }: { model: string; baseUrl?: string; timeoutMs?: number; apiKey?: string }) => {

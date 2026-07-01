@@ -21,6 +21,7 @@
 }
 .PopUpProvider .PopUpFrame.active .PopUpBackground {
     opacity: 1;
+    pointer-events: all;
 }
 .PopUpProvider .PopUpFrame {
     position: relative;
